@@ -67,7 +67,7 @@ export function TrendingPage() {
   const [songs, setSongs] = useState<Song[]>(FALLBACK_SONGS);
 
   useEffect(() => {
-    fetch('/api/featured')
+    fetch('/api/trending?limit=20')
       .then(r => r.ok ? r.json() : null)
       .then((data: { results?: Song[] } | null) => {
         if (data?.results?.length) {

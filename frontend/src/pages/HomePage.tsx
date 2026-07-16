@@ -99,9 +99,19 @@ function SongRow({ song, queue, index }: { song: Song; queue: Song[]; index: num
   );
 }
 
+const MOOD_GENRES: Record<string, string[]> = {
+  Happy: ['pop', 'dance', 'happy', 'k-pop'],
+  Chill: ['r&b', 'acoustic', 'chill', 'soft', 'indie'],
+  Energetic: ['rock', 'electronic', 'dance', 'hip-hop', 'edm', 'latin'],
+  Sad: ['indie', 'acoustic', 'pop', 'sad', 'blues'],
+  Focus: ['classical', 'instrumental', 'lofi', 'electronic', 'ambient'],
+  Party: ['pop', 'hip-hop', 'electronic', 'dance', 'edm', 'latin', 'party'],
+};
+
 export function HomePage({ user }: { user?: string }) {
   const { playSong, currentSong, isPlaying, togglePlay, recentPlays } = useAudio();
   const [featured, setFeatured] = useState<Song[]>(FALLBACK_SONGS);
+  const [selectedMood, setSelectedMood] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -120,7 +130,15 @@ export function HomePage({ user }: { user?: string }) {
       .finally(() => setLoading(false));
   }, []);
 
-  const heroSong = currentSong || featured[0];
+  const filteredFeatured = selectedMood
+    ? featured.filter(song => {
+        const genres = MOOD_GENRES[selectedMood];
+        const songGenre = (song.genre || '').toLowerCase();
+        return genres.some(g => songGenre.includes(g));
+      })
+    : featured;
+
+  const heroSong = currentSong || filteredFeatured[0] || featured[0];
   const greet = () => {
     const h = new Date().getHours();
     if (h < 12) return 'Good morning';
@@ -230,8 +248,15 @@ export function HomePage({ user }: { user?: string }) {
       {/* Featured tracks */}
       <section>
         <div className="flex items-center justify-between mb-3">
-          <h2 className="text-lg font-bold text-white">Featured Tracks</h2>
-          <span className="text-xs text-white/30">Full songs</span>
+          <h2 className="text-lg font-bold text-white">Featured Tracks {selectedMood ? `(${selectedMood})` : ''}</h2>
+          {selectedMood && (
+            <button
+              onClick={() => setSelectedMood(null)}
+              className="text-xs text-white/40 hover:text-white transition"
+            >
+              Clear filter
+            </button>
+          )}
         </div>
         {loading ? (
           <div className="grid gap-2 sm:grid-cols-2">
@@ -241,9 +266,15 @@ export function HomePage({ user }: { user?: string }) {
           </div>
         ) : (
           <div className="grid gap-1 sm:grid-cols-2">
-            {featured.slice(0, 10).map((song, i) => (
-              <SongRow key={song.id} song={song} queue={featured} index={i} />
-            ))}
+            {filteredFeatured.length > 0 ? (
+              filteredFeatured.slice(0, 10).map((song, i) => (
+                <SongRow key={song.id} song={song} queue={filteredFeatured} index={i} />
+              ))
+            ) : (
+              <div className="col-span-2 py-8 text-center text-sm text-white/45">
+                No songs matching the mood "{selectedMood}" found in featured tracks.
+              </div>
+            )}
           </div>
         )}
       </section>
@@ -252,21 +283,29 @@ export function HomePage({ user }: { user?: string }) {
       <section>
         <h2 className="text-lg font-bold text-white mb-3">Browse by Mood</h2>
         <div className="grid grid-cols-3 gap-3 sm:grid-cols-6">
-          {MOODS.map((mood, i) => (
-            <motion.button
-              key={mood.label}
-              className="flex flex-col items-center justify-center gap-1.5 rounded-xl py-4 font-semibold transition-all duration-200"
-              style={{ background: mood.bg, border: `1px solid ${mood.color}25` }}
-              initial={{ opacity: 0, scale: 0.9 }}
-              animate={{ opacity: 1, scale: 1 }}
-              transition={{ delay: i * 0.05 }}
-              whileHover={{ scale: 1.05, borderColor: mood.color + '60' }}
-              whileTap={{ scale: 0.97 }}
-            >
-              <span className="text-2xl">{mood.emoji}</span>
-              <span className="text-xs" style={{ color: mood.color }}>{mood.label}</span>
-            </motion.button>
-          ))}
+          {MOODS.map((mood, i) => {
+            const active = selectedMood === mood.label;
+            return (
+              <motion.button
+                key={mood.label}
+                onClick={() => setSelectedMood(curr => curr === mood.label ? null : mood.label)}
+                className="flex flex-col items-center justify-center gap-1.5 rounded-xl py-4 font-semibold transition-all duration-200"
+                style={{
+                  background: active ? mood.color + '22' : mood.bg,
+                  border: `1px solid ${active ? mood.color : mood.color + '25'}`,
+                  boxShadow: active ? `0 0 14px ${mood.color}35` : 'none'
+                }}
+                initial={{ opacity: 0, scale: 0.9 }}
+                animate={{ opacity: 1, scale: 1 }}
+                transition={{ delay: i * 0.05 }}
+                whileHover={{ scale: 1.05, borderColor: mood.color + '60' }}
+                whileTap={{ scale: 0.97 }}
+              >
+                <span className="text-2xl">{mood.emoji}</span>
+                <span className="text-xs" style={{ color: mood.color }}>{mood.label}</span>
+              </motion.button>
+            );
+          })}
         </div>
       </section>
 

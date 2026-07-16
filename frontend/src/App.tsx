@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useMemo } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
   Bell, Grid2X2, Heart, Home, LogOut, Menu, Music2,
@@ -33,8 +33,8 @@ const BG_DEEP     = '#121212';
 const BG_BASE     = '#181818';
 const BG_SIDEBAR  = 'rgba(18,18,18,0.97)';
 
-function Dashboard({ user, onLogout }: { user: string; onLogout: () => void }) {
-  const { playSong, recentPlays } = useAudio();
+function Dashboard({ user, email, onLogout }: { user: string; email: string; onLogout: () => void }) {
+  const { playSong, recentPlays, currentSong } = useAudio();
   const [tab,         setTab]        = useState<TabId>('home');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
@@ -43,6 +43,37 @@ function Dashboard({ user, onLogout }: { user: string; onLogout: () => void }) {
     setAccountOpen(false);
     onLogout();
   };
+
+  const avatarUrl = useMemo(() => {
+    const combined = `${user} ${email}`.toLowerCase();
+    const femaleIndicators = [
+      'lady', 'girl', 'woman', 'female', 'she', 'her', 'miss', 'mrs', 'ms',
+      'sarah', 'emily', 'jessica', 'ashley', 'amanda', 'brittany', 'taylor', 
+      'elizabeth', 'megan', 'kayla', 'lauren', 'rachel', 'samantha', 'heather',
+      'fatima', 'ayesha', 'zainab', 'mariam', 'maryam', 'khadija', 'amna', 'sana'
+    ];
+    const maleIndicators = [
+      'boy', 'man', 'male', 'he', 'him', 'mr', 'sir',
+      'abdullah', 'tahir', 'ahmed', 'ahmad', 'ali', 'muhammad', 'mohammad', 'usman', 
+      'umar', 'hamza', 'bilal', 'john', 'david', 'michael', 'james', 'robert', 
+      'william', 'joseph', 'daniel', 'alex', 'chris', 'ryan', 'khalid', 'yasir'
+    ];
+
+    let femaleScore = 0;
+    let maleScore = 0;
+
+    for (const word of femaleIndicators) {
+      if (combined.includes(word)) femaleScore++;
+    }
+    for (const word of maleIndicators) {
+      if (combined.includes(word)) maleScore++;
+    }
+
+    if (maleScore > femaleScore) {
+      return 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=140&h=140&fit=crop';
+    }
+    return 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=140&h=140&fit=crop';
+  }, [user, email]);
 
   return (
     <div
@@ -68,6 +99,7 @@ function Dashboard({ user, onLogout }: { user: string; onLogout: () => void }) {
           background: BG_SIDEBAR,
           borderRight: '1px solid rgba(29,185,84,0.08)',
           backdropFilter: 'blur(24px)',
+          paddingBottom: currentSong ? '80px' : '0px',
         }}
         initial={{ x: -246, opacity: 0 }}
         animate={{ x: 0, opacity: 1 }}
@@ -97,7 +129,7 @@ function Dashboard({ user, onLogout }: { user: string; onLogout: () => void }) {
         <div className="flex flex-col items-center px-4 pb-6">
           <div className="relative">
             <img
-              src="https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=140&h=140&fit=crop"
+              src={avatarUrl}
               alt=""
               className="h-14 w-14 rounded-xl object-cover"
               style={{ border: `2px solid rgba(29,185,84,0.25)` }}
@@ -324,7 +356,7 @@ function Dashboard({ user, onLogout }: { user: string; onLogout: () => void }) {
       <nav
         className="fixed left-0 right-0 z-40 flex h-[65px] items-center justify-around lg:hidden"
         style={{
-          bottom: '90px',
+          bottom: currentSong ? '80px' : '0px',
           background: 'rgba(18,18,18,0.95)',
           backdropFilter: 'blur(24px)',
           borderTop: `1px solid rgba(29,185,84,0.12)`,
@@ -352,8 +384,22 @@ function Dashboard({ user, onLogout }: { user: string; onLogout: () => void }) {
   );
 }
 
+interface LocalUser {
+  name: string;
+  email: string;
+}
+
 function AppContent() {
-  const [fallbackUser, setFallbackUser] = useState<string | null>(null);
+  const [fallbackUser, setFallbackUser] = useState<LocalUser | null>(() => {
+    try {
+      const stored = localStorage.getItem('musify_current_user');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        return { name: parsed.name || parsed.email, email: parsed.email };
+      }
+    } catch {}
+    return null;
+  });
   const [authError, setAuthError] = useState<string | null>(null);
   const handledAuthRef = useRef(false);
   const { user, isAuthenticated, isLoading, startAuth, completeAuth, logout } = useSpotify();
@@ -383,7 +429,21 @@ function AppContent() {
     })();
   }, [completeAuth]);
 
-  const activeUser = user?.display_name || fallbackUser;
+  const handleLocalLogin = (nameOrEmail: string) => {
+    try {
+      const stored = localStorage.getItem('musify_current_user');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        setFallbackUser({ name: parsed.name || parsed.email, email: parsed.email });
+      } else {
+        setFallbackUser({ name: nameOrEmail, email: nameOrEmail });
+      }
+    } catch {
+      setFallbackUser({ name: nameOrEmail, email: nameOrEmail });
+    }
+  };
+
+  const activeUser = user?.display_name || fallbackUser?.name;
 
   if (isLoading) {
     return (
@@ -394,7 +454,7 @@ function AppContent() {
   }
 
   if (!isAuthenticated && !activeUser) {
-    return <LoginPage onLogin={setFallbackUser} onSpotifyLogin={startAuth} spotifyEnabled={Boolean(import.meta.env.VITE_SPOTIFY_CLIENT_ID)} />;
+    return <LoginPage onLogin={handleLocalLogin} onSpotifyLogin={startAuth} spotifyEnabled={Boolean(import.meta.env.VITE_SPOTIFY_CLIENT_ID)} />;
   }
 
   if (authError) {
@@ -412,6 +472,7 @@ function AppContent() {
     <AudioProvider>
       <Dashboard
         user={activeUser || 'Listener'}
+        email={user?.email || fallbackUser?.email || ''}
         onLogout={() => {
           localStorage.removeItem('musify_current_user');
           setFallbackUser(null);

@@ -53,13 +53,24 @@ export function SearchPage() {
 
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
-    if (!query.trim()) { setResults([]); setError(''); return; }
+    const activeQuery = query.trim();
+    if (!activeQuery && genre === 'All') {
+      setResults([]);
+      setError('');
+      return;
+    }
 
     debounceRef.current = setTimeout(async () => {
       setLoading(true);
       setError('');
       try {
-        const res = await fetch(`/api/search?q=${encodeURIComponent(query.trim())}`);
+        let url = '';
+        if (activeQuery) {
+          url = `/api/search?q=${encodeURIComponent(activeQuery)}`;
+        } else {
+          url = `/api/search/advanced?genre=${encodeURIComponent(genre)}`;
+        }
+        const res = await fetch(url);
         if (!res.ok) throw new Error('Search failed');
         const data = await res.json() as { results: Song[] };
         let filtered = (data.results ?? []).map((s, i) => ({
@@ -67,7 +78,7 @@ export function SearchPage() {
           audioUrl: s.audioUrl || AUDIO_POOL[i % AUDIO_POOL.length],
           coverUrl: s.coverUrl || COVER_POOL[i % COVER_POOL.length],
         }));
-        if (genre !== 'All') {
+        if (activeQuery && genre !== 'All') {
           filtered = filtered.filter(s => s.genre?.toLowerCase().includes(genre.toLowerCase()));
         }
         setResults(filtered);
@@ -146,9 +157,9 @@ export function SearchPage() {
         ))}
       </div>
 
-      {/* Trending searches (shown when no query) */}
+      {/* Trending searches (shown when no query and no genre selected) */}
       <AnimatePresence mode="wait">
-        {!query.trim() ? (
+        {!(query.trim() || genre !== 'All') ? (
           <motion.div
             key="trending"
             initial={{ opacity: 0 }}
@@ -273,7 +284,9 @@ export function SearchPage() {
             {!loading && !error && results.length === 0 && (
               <div className="flex flex-col items-center justify-center py-20 text-center">
                 <Search size={48} className="mb-4 text-white/20" />
-                <p className="text-lg font-semibold text-white/60">No results for "{query}"</p>
+                <p className="text-lg font-semibold text-white/60">
+                  No results {query.trim() ? `for "${query}"` : genre !== 'All' ? `for genre "${genre}"` : ''}
+                </p>
                 <p className="mt-1 text-sm text-white/30">Try a different title, artist or album</p>
               </div>
             )}

@@ -6,8 +6,9 @@ from typing import Any, List, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
-from fastapi.responses import Response
+from fastapi.responses import Response, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -216,7 +217,7 @@ def _row_get(row: Any, key: str, default: Any = '') -> Any:
 
 def _row_to_song_payload(row: Any, index: int) -> Song:
     return Song(
-        id=str(_row_get(row, 'track_name', _row_get(row, 'id', f'local-{index}'))),
+        id=str(_row_get(row, 'track_id', _row_get(row, 'id', f'local-{index}'))),
         title=str(_row_get(row, 'track_name', _row_get(row, 'title', 'Unknown'))),
         artist=str(_row_get(row, 'artists', _row_get(row, 'artist', 'Unknown'))),
         album=str(_row_get(row, 'album_name', _row_get(row, 'album', ''))),
@@ -262,7 +263,7 @@ def _filter_rows(rows: Any, filters: SearchFilters):
     return results
 
 def _spotify_enabled() -> bool:
-    return bool(SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET)
+    return bool(SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET and SPOTIFY_CLIENT_ID != "YOUR_SPOTIFY_CLIENT_ID" and SPOTIFY_CLIENT_SECRET != "YOUR_SPOTIFY_CLIENT_SECRET")
 
 
 def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
@@ -435,6 +436,103 @@ async def featured_tracks(limit: int = 12):
     selected = row_list[:safe_limit]
     songs = [_row_to_song_payload(row, i).model_dump() for i, row in enumerate(selected)]
     return {'results': songs}
+
+
+@app.get('/api/trending')
+async def trending_tracks(limit: int = 20):
+    """Return top trending tracks sorted by popularity from the local CSV catalog."""
+    safe_limit = min(max(limit, 1), 50)
+    rows = _get_df()
+    if rows is None:
+        fallback = []
+        for i in range(safe_limit):
+            fallback.append({
+                'id': f'static-{i+1}',
+                'title': ['Blinding Lights', 'Levitating', 'Stay', 'Bad Habits', 'Peaches',
+                           'Good 4 U', 'Montero', 'Kiss Me More', 'Leave The Door Open',
+                           'Butter', 'Dynamite', 'Watermelon Sugar', 'Mood', 'Drivers License',
+                           'Positions', 'Save Your Tears', 'Deja Vu', 'Telepatia', 'Build a Bitch',
+                           'Masterpiece'][i % 20],
+                'artist': ['The Weeknd', 'Dua Lipa', 'The Kid LAROI', 'Ed Sheeran', 'Justin Bieber',
+                           'Olivia Rodrigo', 'Lil Nas X', 'Doja Cat', 'Bruno Mars', 'BTS',
+                           'BTS', 'Harry Styles', '24kGoldn', 'Olivia Rodrigo', 'Ariana Grande',
+                           'The Weeknd', 'Olivia Rodrigo', 'Kali Uchis', 'Bella Poarch', 'SZA'][i % 20],
+                'album': 'Featured',
+                'genre': ['Pop', 'Pop', 'Hip-Hop', 'Pop', 'R&B', 'Pop', 'Hip-Hop', 'R&B', 'R&B', 'K-Pop',
+                           'K-Pop', 'Pop', 'Hip-Hop', 'Pop', 'Pop', 'Pop', 'Pop', 'R&B', 'Pop', 'R&B'][i % 20],
+                'coverUrl': COVER_POOL[i % len(COVER_POOL)],
+                'audioUrl': AUDIO_POOL[i % len(AUDIO_POOL)],
+                'duration': 200000 + (i * 10000),
+                'previewAvailable': True,
+            })
+        return {'results': fallback[:safe_limit]}
+
+    def get_pop(r):
+        try:
+            return int(float(_row_get(r, 'popularity', 0)))
+        except Exception:
+            return 0
+
+    sorted_rows = sorted(rows, key=get_pop, reverse=True)
+    selected = sorted_rows[:safe_limit]
+    songs = [_row_to_song_payload(row, i).model_dump() for i, row in enumerate(selected)]
+    return {'results': songs}
+
+
+@app.get('/api/artists')
+async def api_artists(limit: int = 50):
+    rows = _get_df()
+    if not rows:
+        return {'artists': []}
+    
+    artist_map = {}
+    for i, row in enumerate(rows):
+        artist_names = _row_get(row, 'artists', '')
+        if not artist_names:
+            continue
+        primary_artist = artist_names.split(';')[0].strip()
+        if not primary_artist:
+            continue
+            
+        if primary_artist not in artist_map:
+            popularity = int(float(_row_get(row, 'popularity', 0)))
+            artist_map[primary_artist] = {
+                'id': f"art-{len(artist_map)}",
+                'name': primary_artist,
+                'popularity': popularity,
+                'songs': [],
+                'genre': _row_get(row, 'track_genre', ''),
+            }
+        
+        if len(artist_map[primary_artist]['songs']) < 5:
+            artist_map[primary_artist]['songs'].append(_row_to_song_payload(row, i).model_dump())
+            
+    sorted_artists = sorted(artist_map.values(), key=lambda a: a['popularity'], reverse=True)
+    
+    formatted = []
+    for art in sorted_artists[:limit]:
+        import hashlib
+        h = int(hashlib.md5(art['name'].encode('utf-8')).hexdigest(), 16)
+        cover_idx = h % len(COVER_POOL)
+        
+        followers = (art['popularity'] * 123456) + (h % 100000)
+        listeners = (art['popularity'] * 98765) + (h % 50000)
+        
+        colors = ['#8B0000', '#1a006b', '#5c3d00', '#6b006b', '#00456b', '#001a6b']
+        color = colors[h % len(colors)]
+        
+        formatted.append({
+            'id': art['id'],
+            'name': art['name'],
+            'image': COVER_POOL[cover_idx],
+            'genre': art['genre'].title() or 'Pop',
+            'followers': followers,
+            'monthlyListeners': listeners,
+            'color': color,
+            'songs': art['songs'],
+        })
+        
+    return {'artists': formatted}
 
 
 @app.get("/api/search", response_model=SearchResponse)
@@ -732,16 +830,16 @@ async def advanced_search(
             print(f'[backend] advanced Spotify search failed: {exc} — falling back to CSV')
 
     df = _get_df()
-    if df is None or df.empty:
+    if not df:
         return SearchResponse(results=[])
 
     filtered = _filter_rows(df, filters)
-    if filtered is None or filtered.empty:
+    if not filtered:
         return SearchResponse(results=[])
 
     results = [
         _row_to_song_payload(row, index)
-        for index, (_, row) in enumerate(filtered.head(search_limit).iterrows())
+        for index, row in enumerate(filtered[:search_limit])
     ]
     return SearchResponse(results=results)
 
@@ -879,3 +977,23 @@ async def api_analytics_summary(current_user: dict[str, Any] = Depends(_current_
         eventCount=summary['eventCount'],
         topTracks=[Song(**track) for track in summary['topTracks']],
     )
+
+# ---------------------------------------------------------------------------
+# Serve built frontend (production deployment)
+# ---------------------------------------------------------------------------
+_FRONTEND_DIST = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "frontend", "dist"
+)
+
+if os.path.isdir(_FRONTEND_DIST):
+    # Serve static assets (JS, CSS, images)
+    app.mount("/assets", StaticFiles(directory=os.path.join(_FRONTEND_DIST, "assets")), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_spa(full_path: str):
+        """Catch-all: serve the React SPA for any non-API route."""
+        index = os.path.join(_FRONTEND_DIST, "index.html")
+        if os.path.isfile(index):
+            return FileResponse(index)
+        return Response(content="Frontend not built. Run `npm run build` in the frontend/ folder.", status_code=404)

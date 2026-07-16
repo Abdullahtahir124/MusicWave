@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Users, Play, Pause, Heart, X, CheckCircle } from 'lucide-react';
 import { useAudio } from '../context/AudioContext';
@@ -88,8 +88,20 @@ function fmt(ms: number) {
 
 export function ArtistsPage() {
   const { playSong, currentSong, isPlaying, togglePlay, toggleLike, likedSongs } = useAudio();
+  const [artists, setArtists] = useState<Artist[]>(ARTISTS);
   const [selected, setSelected] = useState<Artist | null>(null);
   const [followed, setFollowed] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    fetch('/api/artists')
+      .then(res => res.ok ? res.json() : null)
+      .then((data: { artists?: Artist[] } | null) => {
+        if (data?.artists?.length) {
+          setArtists(data.artists);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   const toggleFollow = (id: string) => {
     setFollowed(prev => {
@@ -120,7 +132,7 @@ export function ArtistsPage() {
 
       {/* Artist grid */}
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
-        {ARTISTS.map((artist, i) => {
+        {artists.map((artist, i) => {
           const isFollowing = followed.has(artist.id);
           return (
             <motion.div

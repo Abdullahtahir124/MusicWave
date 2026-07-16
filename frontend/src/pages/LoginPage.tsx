@@ -54,7 +54,7 @@ function Logo() {
 }
 
 export function LoginPage({ onLogin, onSpotifyLogin, spotifyEnabled = false }: LoginPageProps) {
-  const [mode, setMode] = useState<Mode>('signup');
+  const [mode, setMode] = useState<Mode>(() => readUsers().length > 0 ? 'login' : 'signup');
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -85,6 +85,12 @@ export function LoginPage({ onLogin, onSpotifyLogin, spotifyEnabled = false }: L
 
     if (!cleanEmail || !password) {
       setError('Email and password are required.');
+      return;
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(cleanEmail)) {
+      setError('Please enter a valid email address.');
       return;
     }
 

@@ -29,15 +29,17 @@ def load_data() -> list[dict[str, Any]]:
 
 def clean_data(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Drop empty rows and duplicate records."""
-    seen: set[tuple[tuple[str, Any], ...]] = set()
+    seen: set[str] = set()
     cleaned: list[dict[str, Any]] = []
     for row in rows:
-        if not row or all(value in (None, '') for value in row.values()):
+        if not row:
             continue
-        fingerprint = tuple(sorted((key, value) for key, value in row.items()))
-        if fingerprint in seen:
+        track_id = row.get('track_id')
+        if not track_id:
+            track_id = f"{row.get('track_name', '')}-{row.get('artists', '')}"
+        if track_id in seen:
             continue
-        seen.add(fingerprint)
+        seen.add(track_id)
         cleaned.append(row)
     return cleaned
 
