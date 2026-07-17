@@ -6,6 +6,8 @@ import type { Song } from '../context/AudioContext';
 
 const ACCENT = '#1DB954';
 
+const API_BASE = import.meta.env.VITE_API_URL || '';
+
 const GENRE_FILTERS = ['All', 'Pop', 'Hip-Hop', 'Rock', 'Electronic', 'R&B', 'Jazz', 'Classical', 'Latin'];
 
 const TRENDING_SEARCHES = [
@@ -66,9 +68,9 @@ export function SearchPage() {
       try {
         let url = '';
         if (activeQuery) {
-          url = `/api/search?q=${encodeURIComponent(activeQuery)}`;
+          url = `${API_BASE}/api/search/advanced?q=${encodeURIComponent(activeQuery)}`;
         } else {
-          url = `/api/search/advanced?genre=${encodeURIComponent(genre)}`;
+          url = `${API_BASE}/api/search/advanced?genre=${encodeURIComponent(genre)}`;
         }
         const res = await fetch(url);
         if (!res.ok) throw new Error('Search failed');
