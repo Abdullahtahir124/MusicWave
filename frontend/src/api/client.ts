@@ -2,7 +2,7 @@ import axios from 'axios';
 import type { Song } from '../types';
 import { MOCK_SONGS, LOCAL_RECS } from '../data/mockData';
 
-const http = axios.create({ baseURL: '', timeout: 10_000 });
+const http = axios.create({ baseURL: import.meta.env.VITE_API_URL || '', timeout: 10_000 });
 
 export interface AuthUser {
   id: string;
