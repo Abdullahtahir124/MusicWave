@@ -1,6 +1,8 @@
 import React, { createContext, useContext, useRef, useState, useEffect } from 'react';
 import { useToast } from '../store/toastStore';
 
+const API_BASE = import.meta.env.VITE_API_URL || '';
+
 export interface Song {
   id: string;
   title: string;
@@ -124,7 +126,7 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
         playRequestId: (playRequestIdRef as any)?.current ?? null,
         playSongCalls: (window as any).__playSongCalls ?? 0,
       });
-    } catch {}
+    } catch { }
 
     const handleTimeUpdate = () => {
       if (audioRef.current) {
@@ -144,7 +146,7 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
         volume: a.volume,
       });
     };
-    
+
     const handleDurationChange = () => {
       if (audioRef.current) {
         setDuration(audioRef.current.duration || 0);
@@ -159,7 +161,7 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
     const handleError = (ev: Event) => {
       // eslint-disable-next-line no-console
       console.error('Audio element error', ev, audioRef.current?.src);
-      try { addToast('Audio playback error', 'error'); } catch {}
+      try { addToast('Audio playback error', 'error'); } catch { }
     };
 
     audio.addEventListener('timeupdate', handleTimeUpdate);
@@ -189,12 +191,12 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
   }, []);
 
   const playSong = (song: Song, queue: Song[] = []) => {
-    try { console.log('playSong called', { id: song.id, title: song.title, audioUrl: song.audioUrl }); } catch {}
+    try { console.log('playSong called', { id: song.id, title: song.title, audioUrl: song.audioUrl }); } catch { }
     try {
       // expose a global counter for debugging in the browser console
       (window as any).__lastPlayCall = { id: song.id, title: song.title, audioUrl: song.audioUrl, ts: Date.now() };
       (window as any).__playSongCalls = ((window as any).__playSongCalls || 0) + 1;
-    } catch {}
+    } catch { }
     if (queue.length > 0) {
       setTrackQueue(queue);
     } else if (trackQueue.length === 0 || !trackQueue.find(s => s.id === song.id)) {
@@ -206,7 +208,7 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
       if (!loadingToastRef.current) {
         loadingToastRef.current = addToast(`Loading ${song.title}`, 'info');
       }
-    } catch {}
+    } catch { }
 
     // Track play stats & recents
     setRecentPlays((prev) => {
@@ -223,7 +225,7 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
         timestamp: new Date().toISOString()
       }
     ]);
-    
+
     // debounce/queue rapid playSong calls to prevent interrupted play() promises
     const now = Date.now();
     if (now - lastPlayRef.current < 260) {
@@ -234,7 +236,7 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
         playRequestIdRef.current += 1;
         playSong(song, queue);
       }, 260);
-      try { console.log('playSong debounced, scheduling'); } catch {}
+      try { console.log('playSong debounced, scheduling'); } catch { }
       return;
     }
 
@@ -249,16 +251,16 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
         setIsPlaying(false);
         setDuration(Math.max(0, song.duration / 1000));
         setCurrentTime(0);
-        try { addToast('No audio available for this track', 'error'); } catch {}
+        try { addToast('No audio available for this track', 'error'); } catch { }
         return;
       }
 
       const existingSrc = audioRef.current.src || '';
       if (existingSrc === song.audioUrl) {
-        try { console.log('playSong: same src, calling play only'); } catch {}
+        try { console.log('playSong: same src, calling play only'); } catch { }
         // only call play if this request is still the latest
         if (playRequestIdRef.current !== reqId) {
-          try { console.log('playSong: aborting because a newer request exists'); } catch {}
+          try { console.log('playSong: aborting because a newer request exists'); } catch { }
           return;
         }
         const playPromise = audioRef.current.play();
@@ -271,7 +273,7 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
               try {
                 if (loadingToastRef.current) { removeToast(loadingToastRef.current); loadingToastRef.current = null; }
                 addToast(`Playback failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
-              } catch {}
+              } catch { }
               setIsPlaying(false);
             });
         }
@@ -286,7 +288,7 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
       try {
         // eslint-disable-next-line no-console
         console.log('Attempting playback immediately', { src: audioRef.current.src, readyState: audioRef.current.readyState });
-      } catch {}
+      } catch { }
 
       const playAttempt = () => {
         if (!audioRef.current) return;
@@ -301,7 +303,7 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
                 loadingToastRef.current = null;
               }
               addToast(`Now playing: ${song.title}`, 'success');
-            } catch {}
+            } catch { }
           }).catch(err => {
             // eslint-disable-next-line no-console
             console.error('Playback failed on initial play:', err, 'src=', audioRef.current?.src);
@@ -311,7 +313,7 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
                 loadingToastRef.current = null;
               }
               addToast(`Playback failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
-            } catch {}
+            } catch { }
             setIsPlaying(false);
           });
         }
@@ -321,10 +323,10 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
       const handleNetworkError = () => {
         if (proxied) return;
         proxied = true;
-        try { console.warn('Audio element error detected, retrying via backend proxy'); } catch {}
+        try { console.warn('Audio element error detected, retrying via backend proxy'); } catch { }
         if (!audioRef.current) return;
         audioRef.current.removeEventListener('error', handleNetworkError);
-        audioRef.current.src = `/api/proxy?url=${encodeURIComponent(song.audioUrl || '')}`;
+        audioRef.current.src = `${API_BASE}/api/proxy?url=${encodeURIComponent(song.audioUrl || '')}`;
         playAttempt();
       };
 
@@ -335,7 +337,7 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
 
   const togglePlay = () => {
     if (!audioRef.current) return;
-    try { console.log('togglePlay called', { isPlaying, src: audioRef.current?.src }); } catch {}
+    try { console.log('togglePlay called', { isPlaying, src: audioRef.current?.src }); } catch { }
     if (isPlaying) {
       audioRef.current.pause();
       setIsPlaying(false);
@@ -347,7 +349,7 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
           .catch(err => {
             // eslint-disable-next-line no-console
             console.error('Playback failed:', err, 'src=', audioRef.current?.src);
-            try { addToast(`Playback failed: ${err instanceof Error ? err.message : String(err)}`, 'error'); } catch {}
+            try { addToast(`Playback failed: ${err instanceof Error ? err.message : String(err)}`, 'error'); } catch { }
             setIsPlaying(false);
           });
       }
@@ -403,7 +405,7 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
 
   // Playlists
   const persistPlaylists = (next: Playlist[]) => {
-    try { localStorage.setItem('musify_playlists', JSON.stringify(next)); } catch {}
+    try { localStorage.setItem('musify_playlists', JSON.stringify(next)); } catch { }
   };
 
   const createPlaylist = (name: string) => {
