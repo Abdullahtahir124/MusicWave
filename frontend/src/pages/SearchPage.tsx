@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Search, X, Play, Pause, Heart } from 'lucide-react';
+import { Search, X, Play, Pause, Heart, Radio } from 'lucide-react';
 import { useAudio } from '../context/AudioContext';
 import type { Song } from '../context/AudioContext';
 
@@ -37,6 +37,58 @@ const AUDIO_POOL = [
 function fmt(ms: number) {
   const s = Math.floor(ms / 1000);
   return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`;
+}
+
+// Inline 30-sec preview player for Deezer tracks
+function PreviewPlayer({ previewUrl }: { previewUrl: string }) {
+  const [playing, setPlaying] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    return () => {
+      audioRef.current?.pause();
+    };
+  }, []);
+
+  const toggle = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!audioRef.current) {
+      audioRef.current = new Audio(previewUrl);
+      audioRef.current.addEventListener('timeupdate', () => {
+        const a = audioRef.current!;
+        setProgress(a.duration > 0 ? (a.currentTime / a.duration) * 100 : 0);
+      });
+      audioRef.current.addEventListener('ended', () => {
+        setPlaying(false);
+        setProgress(0);
+      });
+    }
+    if (playing) {
+      audioRef.current.pause();
+      setPlaying(false);
+    } else {
+      audioRef.current.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+    }
+  };
+
+  return (
+    <div
+      className="flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs font-semibold"
+      style={{ background: 'rgba(29,185,84,0.1)', border: '1px solid rgba(29,185,84,0.25)', cursor: 'pointer' }}
+      onClick={toggle}
+      title="Play 30-sec preview"
+    >
+      <Radio size={12} style={{ color: ACCENT }} />
+      <span style={{ color: ACCENT }}>Preview</span>
+      {playing ? <Pause size={11} style={{ color: ACCENT }} /> : <Play size={11} style={{ color: ACCENT }} />}
+      {playing && (
+        <div className="w-16 h-1 rounded-full overflow-hidden" style={{ background: 'rgba(255,255,255,0.15)' }}>
+          <div className="h-full rounded-full transition-all" style={{ width: `${progress}%`, background: ACCENT }} />
+        </div>
+      )}
+    </div>
+  );
 }
 
 export function SearchPage() {
@@ -259,6 +311,11 @@ export function SearchPage() {
                       </div>
 
                       <span className="hidden text-xs text-white/35 sm:block">{fmt(song.duration)}</span>
+
+                      {/* 30-sec preview button for Deezer tracks */}
+                      {song.previewAvailable && song.audioUrl && song.id.startsWith('dz-') && (
+                        <PreviewPlayer previewUrl={song.audioUrl} />
+                      )}
 
                       <button onClick={() => toggleLike(song)}
                         style={{ color: liked ? ACCENT : 'rgba(255,255,255,0.3)' }}

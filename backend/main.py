@@ -1,21 +1,9 @@
 import base64
 import os
+import re
 import sys
 import time
-import dns.resolver
 from typing import Any, List, Optional
-
-def verify_email_domain(email: str) -> bool:
-    try:
-        domain = email.split('@')[1]
-        answers = dns.resolver.resolve(domain, 'MX')
-        return len(answers) > 0
-    except Exception:
-        try:
-            answers = dns.resolver.resolve(domain, 'A')
-            return len(answers) > 0
-        except Exception:
-            return False
 
 
 import httpx
@@ -793,23 +781,42 @@ async def proxy(url: str = Query(...)):
 
 @app.post('/api/auth/register', response_model=AuthResponse)
 async def register(payload: AuthRequest):
-    email = payload.username.strip()
-    if not verify_email_domain(email):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="The email address domain does not exist or cannot receive mail. Please use a real email."
-        )
+    username = payload.username.strip()
+    if not username:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Username is required.')
+
+    # Accept both plain usernames and email addresses
+    if len(username) < 3:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Username must be at least 3 characters.')
+
     try:
-        user = create_user(payload.username, payload.password, payload.displayName)
+        user = create_user(username, payload.password, payload.displayName)
         token = issue_token(user['id'])
         return AuthResponse(token=token, user=user)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except Exception as exc:
+        err_msg = str(exc)
+        if 'ServerSelectionTimeoutError' in err_msg or 'timed out' in err_msg.lower() or 'connection' in err_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail='Cannot reach the database. Please check your internet connection and try again.'
+            ) from exc
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f'Registration failed: {err_msg}') from exc
 
 
 @app.post('/api/auth/login', response_model=AuthResponse)
 async def login(payload: AuthRequest):
-    user = authenticate_user(payload.username, payload.password)
+    try:
+        user = authenticate_user(payload.username, payload.password)
+    except Exception as exc:
+        err_msg = str(exc)
+        if 'ServerSelectionTimeoutError' in err_msg or 'timed out' in err_msg.lower() or 'connection' in err_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail='Cannot reach the database. Please check your internet connection and try again.'
+            ) from exc
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f'Login failed: {err_msg}') from exc
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Invalid username or password')
     token = issue_token(user['id'])
@@ -897,17 +904,21 @@ async def advanced_search(
                         title=t["title"],
                         artist=t["artist"]["name"],
                         album=t["album"]["title"],
-                        genre="Pop",
-                        coverUrl=t["album"]["cover_medium"],
-                        audioUrl=t["preview"],
-                        duration=t["duration"] * 1000,
-                        previewAvailable=True,
+                        genre=filters.genre or "Pop",
+                        coverUrl=t["album"].get("cover_medium") or t["artist"].get("picture_medium") or COVER_POOL[0],
+                        audioUrl=t.get("preview") or AUDIO_POOL[0],
+                        duration=int(t.get("duration", 30)) * 1000,
+                        previewAvailable=bool(t.get("preview")),
                     )
                     if filters.artist and filters.artist.lower() not in song.artist.lower():
                         continue
                     if filters.album and filters.album.lower() not in song.album.lower():
                         continue
                     results.append(song)
+                if results:
+                    return SearchResponse(results=results)
+        except Exception as exc:
+            print(f"[backend] advanced Deezer search failed: {exc} — falling back to CSV")
                 if results:
                     return SearchResponse(results=results)
         except Exception as exc:

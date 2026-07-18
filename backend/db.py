@@ -16,11 +16,28 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 _client: MongoClient | None = None
 
+LOCAL_DB_PATH = os.path.join(os.path.dirname(__file__), "local_db.json")
+
+def _load_local_db() -> dict:
+    if not os.path.exists(LOCAL_DB_PATH):
+        return {"users": {}, "tokens": {}, "favorites": {}, "playlists": {}, "playlist_items": {}}
+    try:
+        with open(LOCAL_DB_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"users": {}, "tokens": {}, "favorites": {}, "playlists": {}, "playlist_items": {}}
+
+def _save_local_db(db_data: dict) -> None:
+    try:
+        with open(LOCAL_DB_PATH, "w", encoding="utf-8") as f:
+            json.dump(db_data, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[db] Failed to save local DB: {exc}")
 
 def _get_db():
     global _client
     if _client is None:
-        _client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=10000)
+        _client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=1500)
     return _client["musicwave"]
 
 
@@ -90,8 +107,9 @@ def create_user(username: str, password: str, display_name: Optional[str] = None
     created_at = _utc_now()
     display = (display_name or clean_username.split("@")[0] or "Listener").strip() or "Listener"
 
-    db = _get_db()
     try:
+        db = _get_db()
+        db.client.admin.command('ping')
         db["users"].insert_one({
             "_id": user_id,
             "id": user_id,
@@ -102,9 +120,19 @@ def create_user(username: str, password: str, display_name: Optional[str] = None
             "created_at": created_at,
         })
     except Exception as exc:
-        if "duplicate" in str(exc).lower() or "E11000" in str(exc):
+        print(f"[db] MongoDB registration failed: {exc} — using local fallback")
+        local_db = _load_local_db()
+        if clean_username in local_db["users"]:
             raise ValueError("Username already exists") from exc
-        raise
+        local_db["users"][clean_username] = {
+            "id": user_id,
+            "username": clean_username,
+            "display_name": display,
+            "password_hash": password_hash,
+            "password_salt": salt,
+            "created_at": created_at,
+        }
+        _save_local_db(local_db)
 
     return {
         "id": user_id,
@@ -116,49 +144,115 @@ def create_user(username: str, password: str, display_name: Optional[str] = None
 
 def authenticate_user(username: str, password: str) -> Optional[dict[str, Any]]:
     clean_username = username.strip().lower()
-    db = _get_db()
-    doc = db["users"].find_one({"username": clean_username})
-    if doc is None:
-        return None
-    expected = _hash_password(password, doc["password_salt"])
-    if not secrets.compare_digest(expected, doc["password_hash"]):
-        return None
-    return _doc_to_user(doc)
+    try:
+        db = _get_db()
+        db.client.admin.command('ping')
+        doc = db["users"].find_one({"username": clean_username})
+        if doc is None:
+            return None
+        expected = _hash_password(password, doc["password_salt"])
+        if not secrets.compare_digest(expected, doc["password_hash"]):
+            return None
+        return _doc_to_user(doc)
+    except Exception as exc:
+        print(f"[db] MongoDB login failed: {exc} — using local fallback")
+        local_db = _load_local_db()
+        user_data = local_db["users"].get(clean_username)
+        if not user_data:
+            return None
+        expected = _hash_password(password, user_data["password_salt"])
+        if not secrets.compare_digest(expected, user_data["password_hash"]):
+            return None
+        return {
+            "id": user_data["id"],
+            "username": user_data["username"],
+            "displayName": user_data["display_name"],
+            "createdAt": user_data["created_at"],
+        }
 
 
 def get_user(user_id: str) -> Optional[dict[str, Any]]:
-    db = _get_db()
-    doc = db["users"].find_one({"_id": user_id})
-    return _doc_to_user(doc) if doc else None
+    try:
+        db = _get_db()
+        db.client.admin.command('ping')
+        doc = db["users"].find_one({"_id": user_id})
+        return _doc_to_user(doc) if doc else None
+    except Exception:
+        local_db = _load_local_db()
+        for u_data in local_db["users"].values():
+            if u_data["id"] == user_id:
+                return {
+                    "id": u_data["id"],
+                    "username": u_data["username"],
+                    "displayName": u_data["display_name"],
+                    "createdAt": u_data["created_at"],
+                }
+        return None
 
 
 def issue_token(user_id: str, ttl_days: int = 30) -> str:
     token = secrets.token_urlsafe(32)
     now = _utc_now()
     expires_at = (datetime.now(timezone.utc) + timedelta(days=ttl_days)).isoformat()
-    db = _get_db()
-    db["tokens"].insert_one({
-        "token": token,
-        "user_id": user_id,
-        "created_at": now,
-        "expires_at": expires_at,
-    })
+    try:
+        db = _get_db()
+        db.client.admin.command('ping')
+        db["tokens"].insert_one({
+            "token": token,
+            "user_id": user_id,
+            "created_at": now,
+            "expires_at": expires_at,
+        })
+    except Exception as exc:
+        print(f"[db] MongoDB token issue failed: {exc} — using local fallback")
+        local_db = _load_local_db()
+        local_db["tokens"][token] = {
+            "token": token,
+            "user_id": user_id,
+            "created_at": now,
+            "expires_at": expires_at,
+        }
+        _save_local_db(local_db)
     return token
 
 
 def revoke_token(token: str) -> None:
-    db = _get_db()
-    db["tokens"].delete_one({"token": token})
+    try:
+        db = _get_db()
+        db["tokens"].delete_one({"token": token})
+    except Exception:
+        local_db = _load_local_db()
+        if token in local_db["tokens"]:
+            del local_db["tokens"][token]
+            _save_local_db(local_db)
 
 
 def get_user_by_token(token: str) -> Optional[dict[str, Any]]:
-    db = _get_db()
     now = _utc_now()
-    tok_doc = db["tokens"].find_one({"token": token, "expires_at": {"$gt": now}})
-    if tok_doc is None:
+    try:
+        db = _get_db()
+        db.client.admin.command('ping')
+        tok_doc = db["tokens"].find_one({"token": token, "expires_at": {"$gt": now}})
+        if tok_doc is None:
+            return None
+        user_doc = db["users"].find_one({"_id": tok_doc["user_id"]})
+        return _doc_to_user(user_doc) if user_doc else None
+    except Exception as exc:
+        print(f"[db] MongoDB token verification failed: {exc} — using local fallback")
+        local_db = _load_local_db()
+        tok_data = local_db["tokens"].get(token)
+        if not tok_data or tok_data["expires_at"] <= now:
+            return None
+        user_id = tok_data["user_id"]
+        for u_data in local_db["users"].values():
+            if u_data["id"] == user_id:
+                return {
+                    "id": u_data["id"],
+                    "username": u_data["username"],
+                    "displayName": u_data["display_name"],
+                    "createdAt": u_data["created_at"],
+                }
         return None
-    user_doc = db["users"].find_one({"_id": tok_doc["user_id"]})
-    return _doc_to_user(user_doc) if user_doc else None
 
 
 # ── Song helpers ─────────────────────────────────────────────────────────────

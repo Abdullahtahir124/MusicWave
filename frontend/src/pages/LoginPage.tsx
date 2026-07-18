@@ -1,10 +1,10 @@
 import React, { useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { Eye, EyeOff, Lock, Mail, Music2, UserRound } from 'lucide-react';
+import { Eye, EyeOff, Lock, Music2, User, UserRound } from 'lucide-react';
 import { registerAccount, loginAccount } from '../api/client';
 
-// Musination — blue accent
-const ACCENT = '#3B82F6';
+// Spotify green accent
+const ACCENT = '#1DB954';
 
 interface LoginPageProps {
   onLogin: (email: string) => void;
@@ -66,8 +66,8 @@ export function LoginPage({ onLogin, onSpotifyLogin, spotifyEnabled = false }: L
 
   const helperCopy = useMemo(() => (
     mode === 'signup'
-      ? 'Create your account first. Then sign in to open your dashboard.'
-      : 'Login with the account you just created.'
+      ? 'Pick a username and password to create your account.'
+      : 'Enter your username and password to sign in.'
   ), [mode]);
 
   const switchMode = (next: Mode) => {
@@ -79,18 +79,17 @@ export function LoginPage({ onLogin, onSpotifyLogin, spotifyEnabled = false }: L
 
   const handleSubmit: React.FormEventHandler<HTMLFormElement> = async (event) => {
     event.preventDefault();
-    const cleanEmail = email.trim().toLowerCase();
-    const cleanName = name.trim() || cleanEmail.split('@')[0] || 'Listener';
+    const cleanUsername = email.trim().toLowerCase();
+    const cleanName = name.trim() || cleanUsername.split('@')[0] || 'Listener';
     setError('');
 
-    if (!cleanEmail || !password) {
-      setError('Email and password are required.');
+    if (!cleanUsername || !password) {
+      setError('Username and password are required.');
       return;
     }
 
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(cleanEmail)) {
-      setError('Please enter a valid email address.');
+    if (cleanUsername.length < 3) {
+      setError('Username must be at least 3 characters.');
       return;
     }
 
@@ -104,42 +103,46 @@ export function LoginPage({ onLogin, onSpotifyLogin, spotifyEnabled = false }: L
         return;
       }
       try {
-        const res = await registerAccount(cleanEmail, password, cleanName);
+        const res = await registerAccount(cleanUsername, password, cleanName);
         localStorage.setItem('musify_token', res.token);
         localStorage.setItem('musify_current_user', JSON.stringify({
-          email: res.user.username,
+          username: res.user.username,
           name: res.user.displayName,
         }));
         const users = readUsers();
-        if (!users.some(u => u.email === cleanEmail)) {
+        if (!users.some(u => u.email === cleanUsername)) {
           localStorage.setItem(STORAGE_KEY, JSON.stringify([...users, {
-            email: cleanEmail,
+            email: cleanUsername,
             password,
             name: cleanName,
           }]));
         }
         onLogin(res.user.displayName || res.user.username);
-      } catch (err: any) {
-        setError(err.response?.data?.detail || err.message || 'Registration failed.');
+      } catch (err: unknown) {
+        const anyErr = err as any;
+        const detail = anyErr?.response?.data?.detail || anyErr?.message || 'Registration failed.';
+        setError(detail);
       }
       return;
     }
 
     try {
-      const res = await loginAccount(cleanEmail, password);
+      const res = await loginAccount(cleanUsername, password);
       localStorage.setItem('musify_token', res.token);
       localStorage.setItem('musify_current_user', JSON.stringify({
-        email: res.user.username,
+        username: res.user.username,
         name: res.user.displayName,
       }));
       onLogin(res.user.displayName || res.user.username);
-    } catch (err: any) {
-      setError(err.response?.data?.detail || err.message || 'Login failed.');
+    } catch (err: unknown) {
+      const anyErr = err as any;
+      const detail = anyErr?.response?.data?.detail || anyErr?.message || 'Login failed.';
+      setError(detail);
     }
   };
 
   return (
-    <div className="auth-stage min-h-screen w-full overflow-hidden bg-[#05080F] text-white">
+    <div className="auth-stage min-h-screen w-full overflow-hidden bg-[#121212] text-white">
       <div className="auth-backdrop" aria-hidden />
       <motion.div
         className="auth-device auth-device-left"
@@ -190,19 +193,19 @@ export function LoginPage({ onLogin, onSpotifyLogin, spotifyEnabled = false }: L
             <motion.form onSubmit={handleSubmit} className="mt-8 flex flex-col gap-4" noValidate variants={formMotion} initial="hidden" animate="show">
               {mode === 'signup' && (
                 <motion.label className="auth-field" variants={fieldMotion}>
-                  <span>Name</span>
+                  <span>Display Name</span>
                   <div>
                     <UserRound size={15} />
-                    <input value={name} onChange={e => setName(e.target.value)} placeholder="Enter your name" autoComplete="name" />
+                    <input value={name} onChange={e => setName(e.target.value)} placeholder="How should we call you?" autoComplete="name" />
                   </div>
                 </motion.label>
               )}
 
               <motion.label className="auth-field" variants={fieldMotion}>
-                <span>Email</span>
+                <span>Username</span>
                 <div>
-                  <Mail size={15} />
-                  <input value={email} onChange={e => setEmail(e.target.value)} placeholder="Enter your email" autoComplete="email" type="email" />
+                  <User size={15} />
+                  <input value={email} onChange={e => setEmail(e.target.value)} placeholder={mode === 'signup' ? 'Choose a username' : 'Enter your username'} autoComplete="username" type="text" />
                 </div>
               </motion.label>
 
