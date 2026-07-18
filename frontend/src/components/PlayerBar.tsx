@@ -1,216 +1,352 @@
-import type { MouseEvent } from 'react';
-import { useState } from 'react';
+import React, { createContext, useContext, useRef, useState, useEffect } from 'react';
 import { useToast } from '../store/toastStore';
-import {
-  Play, Pause, Heart, SkipBack, SkipForward,
-  Volume2, VolumeX, Repeat, Shuffle,
-} from 'lucide-react';
-import { useAudio } from '../context/AudioContext';
 
-const ACCENT = '#1DB954';
-
-function fmt(s: number) {
-  if (!isFinite(s) || s < 0) return '0:00';
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  return `${m}:${sec.toString().padStart(2, '0')}`;
+export interface Song {
+  id: string;
+  title: string;
+  artist: string;
+  album?: string;
+  genre: string;
+  coverUrl: string;
+  audioUrl: string | null;
+  duration: number;
+  previewAvailable?: boolean;
+  isPreview?: boolean;
+  matchScore?: number;
 }
 
-export const PlayerBar = () => {
-  const {
-    currentSong,
-    isPlaying,
-    duration,
-    currentTime,
-    volume,
-    playbackRate,
-    likedSongs,
-    togglePlay,
-    seek,
-    setVolumeLevel,
-    setPlaybackRate,
-    prevTrack,
-    nextTrack,
-    toggleLike,
-  } = useAudio();
+export interface PlayEvent {
+  songId: string;
+  title: string;
+  genre: string;
+  timestamp: string; // ISO String
+}
 
-  const { addToast } = useToast();
-  const [muted, setMuted] = useState(false);
-  const [prevVol, setPrevVol] = useState(0.7);
+export interface Playlist {
+  id: string;
+  name: string;
+  songs: Song[];
+}
 
-  const pct = duration > 0 ? (currentTime / duration) * 100 : 0;
-  const isLiked = currentSong ? likedSongs.some(s => s.id === currentSong.id) : false;
-
-  if (!currentSong) return null;
-
-  const handleToggleLike = (e: MouseEvent<HTMLButtonElement>) => {
-    e.stopPropagation();
-    if (!currentSong) return;
-    const wasLiked = likedSongs.some(s => s.id === currentSong.id);
-    toggleLike(currentSong);
-    addToast(wasLiked ? `Removed from Liked` : `Added to Liked`, wasLiked ? 'info' : 'success');
+interface AudioContextType {
+  currentSong: Song | null;
+  isPlaying: boolean;
+  duration: number;
+  currentTime: number;
+  volume: number;
+  playbackRate: number;
+  analyser: AnalyserNode | null;
+  likedSongs: Song[];
+  recentPlays: Song[];
+  playHistory: PlayEvent[];
+  playSong: (song: Song, queue?: Song[]) => void;
+  togglePlay: () => void;
+  seek: (time: number) => void;
+  setVolumeLevel: (volume: number) => void;
+  setPlaybackRate: (rate: number) => void;
+  nextTrack: () => void;
+  prevTrack: () => void;
+  toggleLike: (song: Song) => void;
+  playlists: Playlist[];
+  createPlaylist: (name: string) => Playlist;
+  addSongToPlaylist: (playlistId: string, song: Song) => void;
+  removeSongFromPlaylist: (playlistId: string, songId: string) => void;
+  renamePlaylist: (playlistId: string, name: string) => void;
+  deletePlaylist: (playlistId: string) => void;
+  playPlaylist: (playlistId: string, shuffle?: boolean) => void;
+  shufflePlaylist: (playlistId: string) => void;
+  audioDebug: {
+    src: string | null;
+    readyState: number | null;
+    networkState: number | null;
+    errorCode: number | null;
+    errorMessage: string | null;
+    volume: number;
   };
+}
 
-  const handleMute = (e: MouseEvent<HTMLButtonElement>) => {
-    e.stopPropagation();
-    if (muted) {
-      setVolumeLevel(prevVol);
-      setMuted(false);
+const AudioCtx = createContext<AudioContextType | undefined>(undefined);
+
+// Spotify's Track IDs are 22-character base62 strings (e.g. "0VjIjW4GlUZAMYd2vXMi3b").
+// Local/mock fallback songs (e.g. "static-1") are NOT valid Spotify IDs and can't be embedded.
+function isValidSpotifyId(id: string) {
+  return /^[A-Za-z0-9]{22}$/.test(id);
+}
+
+export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
+  const [currentSong, setCurrentSong] = useState<Song | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [volume, setVolume] = useState(0.5);
+  const [audioDebug, setAudioDebug] = useState({
+    src: null as string | null,
+    readyState: null as number | null,
+    networkState: null as number | null,
+    errorCode: null as number | null,
+    errorMessage: null as string | null,
+    volume: 1,
+  });
+  const [playbackRate, setPlaybackRateState] = useState(1);
+  const [trackQueue, setTrackQueue] = useState<Song[]>([]);
+
+  // User list state
+  const [likedSongs, setLikedSongs] = useState<Song[]>([]);
+  const [recentPlays, setRecentPlays] = useState<Song[]>([]);
+  const [playHistory, setPlayHistory] = useState<PlayEvent[]>([]);
+  const [playlists, setPlaylists] = useState<Playlist[]>(() => {
+    try {
+      const raw = localStorage.getItem('musify_playlists');
+      return raw ? JSON.parse(raw) as Playlist[] : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const { addToast, removeToast } = useToast();
+  const loadingToastRef = useRef<string | null>(null);
+
+  // Spotify IFrame API controller ref
+  const controllerRef = useRef<any>(null);
+  const apiReadyRef = useRef(false);
+  const pendingUriRef = useRef<string | null>(null);
+  const currentSongRef = useRef<Song | null>(null);
+  currentSongRef.current = currentSong;
+
+  useEffect(() => {
+    // Load the Spotify IFrame API script if it's not already on the page
+    if (!document.getElementById('spotify-iframe-api-script')) {
+      const script = document.createElement('script');
+      script.id = 'spotify-iframe-api-script';
+      script.src = 'https://open.spotify.com/embed/iframe-api/v1';
+      script.async = true;
+      document.body.appendChild(script);
+    }
+
+    (window as any).onSpotifyIframeApiReady = (IFrameAPI: any) => {
+      const element = document.getElementById('spotify-embed');
+      if (!element) return;
+
+      const options = { uri: '', width: '1', height: '1' };
+      const callback = (EmbedController: any) => {
+        controllerRef.current = EmbedController;
+        apiReadyRef.current = true;
+
+        EmbedController.addListener('playback_update', (e: any) => {
+          const data = e?.data ?? {};
+          if (typeof data.position === 'number') setCurrentTime(data.position / 1000);
+          if (typeof data.duration === 'number') setDuration(data.duration / 1000);
+          if (typeof data.isPaused === 'boolean') setIsPlaying(!data.isPaused);
+
+          if (data.isPaused && data.position === 0 && data.duration > 0 && currentSongRef.current) {
+            // Track likely ended — advance queue
+            nextTrackRef.current();
+          }
+        });
+
+        EmbedController.addListener('ready', () => {
+          if (pendingUriRef.current) {
+            EmbedController.loadUri(pendingUriRef.current);
+            EmbedController.play();
+            pendingUriRef.current = null;
+          }
+        });
+      };
+
+      IFrameAPI.createController(element, options, callback);
+    };
+
+    return () => {
+      (window as any).onSpotifyIframeApiReady = undefined;
+    };
+  }, []);
+
+  // Keep a ref to nextTrack so the playback_update listener (created once) always calls the latest version
+  const nextTrackRef = useRef<() => void>(() => { });
+
+  const playSong = (song: Song, queue: Song[] = []) => {
+    if (queue.length > 0) {
+      setTrackQueue(queue);
+    } else if (trackQueue.length === 0 || !trackQueue.find(s => s.id === song.id)) {
+      setTrackQueue([song]);
+    }
+
+    setCurrentSong(song);
+
+    setRecentPlays((prev) => {
+      const filtered = prev.filter(s => s.id !== song.id);
+      return [song, ...filtered].slice(0, 10);
+    });
+
+    setPlayHistory((prev) => [
+      ...prev,
+      {
+        songId: song.id,
+        title: song.title,
+        genre: song.genre || 'Pop',
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+
+    if (!isValidSpotifyId(song.id)) {
+      setIsPlaying(false);
+      try { addToast('This track has no Spotify ID available for playback', 'error'); } catch { }
+      return;
+    }
+
+    const uri = `spotify:track:${song.id}`;
+
+    try {
+      if (!loadingToastRef.current) {
+        loadingToastRef.current = addToast(`Loading ${song.title}`, 'info');
+      }
+    } catch { }
+
+    if (controllerRef.current && apiReadyRef.current) {
+      controllerRef.current.loadUri(uri);
+      controllerRef.current.play();
+      try {
+        if (loadingToastRef.current) { removeToast(loadingToastRef.current); loadingToastRef.current = null; }
+        addToast(`Now playing: ${song.title}`, 'success');
+      } catch { }
     } else {
-      setPrevVol(volume);
-      setVolumeLevel(0);
-      setMuted(true);
+      // Controller not ready yet — queue it up, the 'ready' listener will pick it up
+      pendingUriRef.current = uri;
     }
   };
 
+  const togglePlay = () => {
+    if (!controllerRef.current) return;
+    controllerRef.current.togglePlay();
+  };
+
+  const seek = (time: number) => {
+    if (!controllerRef.current) return;
+    controllerRef.current.seek(time);
+    setCurrentTime(time);
+  };
+
+  const setVolumeLevel = (val: number) => {
+    // Spotify's embedded widget manages its own audio volume internally and
+    // does not expose a volume-control method via the IFrame API.
+    setVolume(val);
+  };
+
+  const setPlaybackRate = (_rate: number) => {
+    // Not supported by the Spotify embed — playback speed is fixed at 1x.
+    setPlaybackRateState(1);
+  };
+
+  const nextTrack = () => {
+    if (trackQueue.length === 0 || !currentSong) return;
+    const currentIndex = trackQueue.findIndex(s => s.id === currentSong.id);
+    if (currentIndex !== -1 && currentIndex < trackQueue.length - 1) {
+      playSong(trackQueue[currentIndex + 1], trackQueue);
+    }
+  };
+  nextTrackRef.current = nextTrack;
+
+  const prevTrack = () => {
+    if (trackQueue.length === 0 || !currentSong) return;
+    const currentIndex = trackQueue.findIndex(s => s.id === currentSong.id);
+    if (currentIndex > 0) {
+      playSong(trackQueue[currentIndex - 1], trackQueue);
+    }
+  };
+
+  const toggleLike = (song: Song) => {
+    setLikedSongs((prev) => {
+      const isLiked = prev.some(s => s.id === song.id);
+      if (isLiked) {
+        return prev.filter(s => s.id !== song.id);
+      } else {
+        return [...prev, song];
+      }
+    });
+  };
+
+  // Playlists
+  const persistPlaylists = (next: Playlist[]) => {
+    try { localStorage.setItem('musify_playlists', JSON.stringify(next)); } catch { }
+  };
+
+  const createPlaylist = (name: string) => {
+    const p: Playlist = { id: crypto.randomUUID(), name: name || 'Untitled', songs: [] };
+    setPlaylists(prev => { const next = [p, ...prev]; persistPlaylists(next); return next; });
+    return p;
+  };
+
+  const addSongToPlaylist = (playlistId: string, song: Song) => {
+    setPlaylists(prev => {
+      const next = prev.map(pl => {
+        if (pl.id !== playlistId) return pl;
+        if (pl.songs.some(s => s.id === song.id)) return pl;
+        return { ...pl, songs: [song, ...pl.songs] };
+      });
+      persistPlaylists(next);
+      return next;
+    });
+  };
+
+  const removeSongFromPlaylist = (playlistId: string, songId: string) => {
+    setPlaylists(prev => {
+      const next = prev.map(pl => pl.id === playlistId ? { ...pl, songs: pl.songs.filter(s => s.id !== songId) } : pl);
+      persistPlaylists(next);
+      return next;
+    });
+  };
+
+  const renamePlaylist = (playlistId: string, name: string) => {
+    setPlaylists(prev => {
+      const next = prev.map(pl => pl.id === playlistId ? { ...pl, name } : pl);
+      persistPlaylists(next);
+      return next;
+    });
+  };
+
+  const deletePlaylist = (playlistId: string) => {
+    setPlaylists(prev => {
+      const next = prev.filter(pl => pl.id !== playlistId);
+      persistPlaylists(next);
+      return next;
+    });
+  };
+
+  const playPlaylist = (playlistId: string, shuffle = false) => {
+    const pl = playlists.find(p => p.id === playlistId);
+    if (!pl || pl.songs.length === 0) return;
+    const queue = shuffle ? [...pl.songs].sort(() => Math.random() - 0.5) : pl.songs;
+    setTrackQueue(queue);
+    playSong(queue[0], queue);
+  };
+
+  const shufflePlaylist = (playlistId: string) => {
+    const pl = playlists.find(p => p.id === playlistId);
+    if (!pl) return;
+    const shuffled = [...pl.songs].sort(() => Math.random() - 0.5);
+    setPlaylists(prev => {
+      const next = prev.map(p => p.id === playlistId ? { ...p, songs: shuffled } : p);
+      persistPlaylists(next);
+      return next;
+    });
+  };
+
   return (
-    <div
-      className="fixed bottom-0 left-0 right-0 z-50 flex items-center justify-between gap-4 px-4 py-3 lg:px-6"
-      style={{
-        background: 'rgba(18,18,18,0.96)',
-        backdropFilter: 'blur(24px)',
-        borderTop: '1px solid rgba(29,185,84,0.12)',
-        minHeight: '80px',
-      }}
-      role="region"
-      aria-label="Now playing"
-    >
-      {/* ── Track info ── */}
-      <div className="flex min-w-0 items-center gap-3 w-[30%]">
-        <div className="relative h-14 w-14 flex-shrink-0 overflow-hidden rounded-md">
-          <img
-            src={currentSong.coverUrl}
-            alt={currentSong.title}
-            className="h-full w-full object-cover"
-          />
-          {isPlaying && (
-            <span
-              className="absolute bottom-1 right-1 h-2 w-2 rounded-full"
-              style={{ background: ACCENT, boxShadow: `0 0 8px ${ACCENT}` }}
-            />
-          )}
-        </div>
-        <div className="min-w-0">
-          <p className="truncate text-sm font-semibold text-white">{currentSong.title}</p>
-          <p className="truncate text-xs text-white/50">{currentSong.artist}</p>
-        </div>
-        <button
-          onClick={handleToggleLike}
-          className="ml-2 flex-shrink-0 transition-all duration-200 hover:scale-110"
-          style={{ color: isLiked ? ACCENT : 'rgba(255,255,255,0.4)' }}
-          aria-label="Toggle like"
-        >
-          <Heart size={18} fill={isLiked ? 'currentColor' : 'none'} />
-        </button>
-      </div>
-
-      {/* ── Controls + seek ── */}
-      <div className="flex flex-1 flex-col items-center gap-2 max-w-[40%]">
-        {/* Buttons */}
-        <div className="flex items-center gap-4">
-          <button
-            className="hidden text-white/40 transition hover:text-white sm:block"
-            aria-label="Shuffle"
-          >
-            <Shuffle size={16} />
-          </button>
-          <button
-            onClick={(e) => { e.stopPropagation(); prevTrack(); }}
-            className="text-white/70 transition hover:text-white hover:scale-110"
-            aria-label="Previous"
-          >
-            <SkipBack size={20} />
-          </button>
-          <button
-            onClick={(e) => { e.stopPropagation(); togglePlay(); }}
-            className="flex h-10 w-10 items-center justify-center rounded-full text-black transition hover:scale-105 active:scale-95"
-            style={{ background: ACCENT, boxShadow: `0 0 20px rgba(29,185,84,0.4)` }}
-            aria-label={isPlaying ? 'Pause' : 'Play'}
-          >
-            {isPlaying ? <Pause size={18} fill="currentColor" /> : <Play size={18} fill="currentColor" />}
-          </button>
-          <button
-            onClick={(e) => { e.stopPropagation(); nextTrack(); }}
-            className="text-white/70 transition hover:text-white hover:scale-110"
-            aria-label="Next"
-          >
-            <SkipForward size={20} />
-          </button>
-          <button
-            className="hidden text-white/40 transition hover:text-white sm:block"
-            aria-label="Repeat"
-          >
-            <Repeat size={16} />
-          </button>
-        </div>
-
-        {/* Seek bar */}
-        <div className="flex w-full items-center gap-2">
-          <span className="w-10 text-right text-[11px] text-white/40">{fmt(currentTime)}</span>
-          <div
-            className="relative h-1 flex-1 cursor-pointer rounded-full"
-            style={{ background: 'rgba(255,255,255,0.15)' }}
-            onClick={(e) => {
-              e.stopPropagation();
-              const rect = e.currentTarget.getBoundingClientRect();
-              const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-              seek(ratio * duration);
-            }}
-          >
-            <div
-              className="absolute left-0 top-0 h-full rounded-full transition-all"
-              style={{ width: `${pct}%`, background: ACCENT }}
-            />
-            <div
-              className="absolute top-1/2 h-3 w-3 -translate-y-1/2 rounded-full bg-white opacity-0 transition-opacity hover:opacity-100"
-              style={{ left: `calc(${pct}% - 6px)` }}
-            />
-          </div>
-          <span className="w-10 text-[11px] text-white/40">{fmt(duration)}</span>
-        </div>
-      </div>
-
-      {/* ── Volume + speed ── */}
-      <div className="hidden w-[25%] items-center justify-end gap-3 lg:flex">
-        {/* Speed */}
-        <div className="flex items-center gap-1">
-          {[0.5, 1, 1.5, 2].map(rate => (
-            <button
-              key={rate}
-              onClick={(e) => { e.stopPropagation(); setPlaybackRate(rate); }}
-              className="rounded px-1.5 py-0.5 text-[10px] font-bold transition"
-              style={{
-                background: playbackRate === rate ? 'rgba(29,185,84,0.2)' : 'transparent',
-                color: playbackRate === rate ? ACCENT : 'rgba(255,255,255,0.35)',
-                border: `1px solid ${playbackRate === rate ? 'rgba(29,185,84,0.4)' : 'transparent'}`,
-              }}
-            >
-              {rate}x
-            </button>
-          ))}
-        </div>
-
-        {/* Volume */}
-        <button onClick={handleMute} className="text-white/50 transition hover:text-white">
-          {muted || volume === 0 ? <VolumeX size={17} /> : <Volume2 size={17} />}
-        </button>
-        <div
-          className="relative h-1 w-24 cursor-pointer rounded-full"
-          style={{ background: 'rgba(255,255,255,0.15)' }}
-          onClick={(e) => {
-            e.stopPropagation();
-            const rect = e.currentTarget.getBoundingClientRect();
-            const v = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-            setVolumeLevel(v);
-            setMuted(false);
-          }}
-        >
-          <div
-            className="absolute left-0 top-0 h-full rounded-full"
-            style={{ width: `${(muted ? 0 : volume) * 100}%`, background: ACCENT }}
-          />
-        </div>
-      </div>
-    </div>
+    <AudioCtx.Provider value={{
+      currentSong, isPlaying, duration, currentTime, volume, playbackRate,
+      analyser: null, likedSongs, recentPlays, playHistory,
+      playSong, togglePlay, seek, setVolumeLevel, setPlaybackRate, nextTrack, prevTrack, toggleLike,
+      playlists, createPlaylist, addSongToPlaylist,
+      removeSongFromPlaylist, renamePlaylist, deletePlaylist, playPlaylist, shufflePlaylist,
+      audioDebug,
+    }}>
+      {children}
+    </AudioCtx.Provider>
   );
+};
+
+export const useAudio = () => {
+  const context = useContext(AudioCtx);
+  if (!context) throw new Error("useAudio must be used within AudioProvider");
+  return context;
 };
