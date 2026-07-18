@@ -92,7 +92,7 @@ export function SpotifyProvider({ children }: { children: React.ReactNode }) {
 
     async function boot() {
       try {
-        const token = sessionStorage.getItem('musination_spotify:tokens');
+        const token = sessionStorage.getItem('musicwave_spotify:tokens');
         if (!token) {
           if (!ignore) setIsLoading(false);
           return;

@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { Eye, EyeOff, Lock, Mail, Music2, UserRound } from 'lucide-react';
+import { registerAccount, loginAccount } from '../api/client';
 
 // Musination — blue accent
 const ACCENT = '#3B82F6';
@@ -47,7 +48,7 @@ function Logo() {
     <div className="flex items-center gap-2">
       <Music2 size={22} style={{ color: ACCENT }} />
       <span className="text-2xl font-black tracking-tight text-white" style={{ fontFamily: 'Poppins' }}>
-        Musi<span style={{ color: ACCENT }}>nation</span>
+        Music<span style={{ color: ACCENT }}>Wave</span>
       </span>
     </div>
   );
@@ -76,11 +77,10 @@ export function LoginPage({ onLogin, onSpotifyLogin, spotifyEnabled = false }: L
     setConfirm('');
   };
 
-  const handleSubmit: React.FormEventHandler<HTMLFormElement> = (event) => {
+  const handleSubmit: React.FormEventHandler<HTMLFormElement> = async (event) => {
     event.preventDefault();
     const cleanEmail = email.trim().toLowerCase();
     const cleanName = name.trim() || cleanEmail.split('@')[0] || 'Listener';
-    const users = readUsers();
     setError('');
 
     if (!cleanEmail || !password) {
@@ -103,29 +103,39 @@ export function LoginPage({ onLogin, onSpotifyLogin, spotifyEnabled = false }: L
         setError('Passwords do not match.');
         return;
       }
-      if (users.some(user => user.email === cleanEmail)) {
-        setError('This email already has an account. Login instead.');
-        return;
+      try {
+        const res = await registerAccount(cleanEmail, password, cleanName);
+        localStorage.setItem('musify_token', res.token);
+        localStorage.setItem('musify_current_user', JSON.stringify({
+          email: res.user.username,
+          name: res.user.displayName,
+        }));
+        const users = readUsers();
+        if (!users.some(u => u.email === cleanEmail)) {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify([...users, {
+            email: cleanEmail,
+            password,
+            name: cleanName,
+          }]));
+        }
+        onLogin(res.user.displayName || res.user.username);
+      } catch (err: any) {
+        setError(err.response?.data?.detail || err.message || 'Registration failed.');
       }
-      localStorage.setItem(STORAGE_KEY, JSON.stringify([...users, {
-        email: cleanEmail,
-        password,
-        name: cleanName,
-      }]));
-      setMode('login');
-      setError('Account created. Login now to continue.');
-      setPassword('');
-      setConfirm('');
       return;
     }
 
-    const match = users.find(user => user.email === cleanEmail && user.password === password);
-    if (!match) {
-      setError('No matching account found. Please signup first or check your password.');
-      return;
+    try {
+      const res = await loginAccount(cleanEmail, password);
+      localStorage.setItem('musify_token', res.token);
+      localStorage.setItem('musify_current_user', JSON.stringify({
+        email: res.user.username,
+        name: res.user.displayName,
+      }));
+      onLogin(res.user.displayName || res.user.username);
+    } catch (err: any) {
+      setError(err.response?.data?.detail || err.message || 'Login failed.');
     }
-    localStorage.setItem('musify_current_user', JSON.stringify(match));
-    onLogin(match.name || match.email);
   };
 
   return (

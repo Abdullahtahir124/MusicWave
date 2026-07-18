@@ -48,7 +48,7 @@ export const startSpotifyAuth = noop;
 export const handleSpotifyAuthCallback = (_code: string, _state: string): Promise<void> => noop();
 export const getSpotifyUser = (): Promise<SpotifyUser> => noop();
 export const clearSpotifySession = (): void => {
-  try { sessionStorage.removeItem('musination_spotify:tokens'); } catch { /* noop */ }
+  try { sessionStorage.removeItem('musicwave_spotify:tokens'); } catch { /* noop */ }
 };
 
 export const getFeaturedPlaylists = (): Promise<SpotifyPlaylist[]> => Promise.resolve([]);
