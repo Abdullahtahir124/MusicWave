@@ -2,7 +2,21 @@ import base64
 import os
 import sys
 import time
+import dns.resolver
 from typing import Any, List, Optional
+
+def verify_email_domain(email: str) -> bool:
+    try:
+        domain = email.split('@')[1]
+        answers = dns.resolver.resolve(domain, 'MX')
+        return len(answers) > 0
+    except Exception:
+        try:
+            answers = dns.resolver.resolve(domain, 'A')
+            return len(answers) > 0
+        except Exception:
+            return False
+
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
@@ -565,6 +579,35 @@ async def search_songs(q: str = Query(..., min_length=2)):
         except Exception as exc:
             print(f"[backend] Spotify search failed: {exc} — falling back to CSV")
 
+    # ── Deezer Fallback when Spotify is disabled ──────────────────────────────
+    if not _spotify_enabled():
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://api.deezer.com/search",
+                    params={"q": q, "limit": 20},
+                    timeout=10,
+                )
+            if resp.status_code == 200:
+                items = resp.json().get("data", [])
+                results: List[Song] = []
+                for i, t in enumerate(items):
+                    results.append(Song(
+                        id=f"dz-{t['id']}",
+                        title=t["title"],
+                        artist=t["artist"]["name"],
+                        album=t["album"]["title"],
+                        genre="Pop",
+                        coverUrl=t["album"]["cover_medium"],
+                        audioUrl=t["preview"],
+                        duration=t["duration"] * 1000,
+                        previewAvailable=True,
+                    ))
+                if results:
+                    return SearchResponse(results=results)
+        except Exception as exc:
+            print(f"[backend] Deezer search failed: {exc} — falling back to CSV")
+
     # ── Local CSV fallback ───────────────────────────────────────────────────
     rows = _get_df()
     if not rows:
@@ -750,6 +793,12 @@ async def proxy(url: str = Query(...)):
 
 @app.post('/api/auth/register', response_model=AuthResponse)
 async def register(payload: AuthRequest):
+    email = payload.username.strip()
+    if not verify_email_domain(email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The email address domain does not exist or cannot receive mail. Please use a real email."
+        )
     try:
         user = create_user(payload.username, payload.password, payload.displayName)
         token = issue_token(user['id'])
@@ -828,6 +877,41 @@ async def advanced_search(
                 return SearchResponse(results=results[:search_limit])
         except Exception as exc:
             print(f'[backend] advanced Spotify search failed: {exc} — falling back to CSV')
+
+    # ── Deezer Fallback when Spotify is disabled ──────────────────────────────
+    if not _spotify_enabled() and (filters.q.strip() or filters.genre.strip()):
+        try:
+            query_str = filters.q.strip() or filters.genre.strip()
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://api.deezer.com/search",
+                    params={"q": query_str, "limit": search_limit},
+                    timeout=10,
+                )
+            if resp.status_code == 200:
+                items = resp.json().get("data", [])
+                results: list[Song] = []
+                for t in items:
+                    song = Song(
+                        id=f"dz-{t['id']}",
+                        title=t["title"],
+                        artist=t["artist"]["name"],
+                        album=t["album"]["title"],
+                        genre="Pop",
+                        coverUrl=t["album"]["cover_medium"],
+                        audioUrl=t["preview"],
+                        duration=t["duration"] * 1000,
+                        previewAvailable=True,
+                    )
+                    if filters.artist and filters.artist.lower() not in song.artist.lower():
+                        continue
+                    if filters.album and filters.album.lower() not in song.album.lower():
+                        continue
+                    results.append(song)
+                if results:
+                    return SearchResponse(results=results)
+        except Exception as exc:
+            print(f"[backend] advanced Deezer search failed: {exc} — falling back to CSV")
 
     df = _get_df()
     if not df:
