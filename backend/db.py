@@ -38,7 +38,11 @@ def _save_local_db(db_data: dict) -> None:
 def _get_db():
     global _client
     if _client is None:
-        kwargs: dict[str, Any] = {"serverSelectionTimeoutMS": 8000, "connectTimeoutMS": 8000}
+        kwargs: dict[str, Any] = {
+            "serverSelectionTimeoutMS": 5000,
+            "connectTimeoutMS": 5000,
+            "socketTimeoutMS": 5000,
+        }
         if MONGODB_URI.startswith("mongodb+srv://") or "ssl=true" in MONGODB_URI or "tls=true" in MONGODB_URI:
             kwargs["tls"] = True
             kwargs["tlsCAFile"] = certifi.where()
@@ -55,7 +59,7 @@ def _hash_password(password: str, salt: str) -> str:
         "sha256",
         password.encode("utf-8"),
         salt.encode("utf-8"),
-        120_000,
+        50_000,
     )
     return digest.hex()
 
