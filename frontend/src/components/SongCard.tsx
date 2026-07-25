@@ -1,6 +1,12 @@
 import { Pause, Play, Heart } from 'lucide-react';
 import type { Song } from '../types';
 
+const STATUS_CONFIG: Record<string, { label: string; color: string; bg: string }> = {
+  available: { label: 'Available', color: '#1DB954', bg: 'rgba(29,185,84,0.12)' },
+  preview: { label: 'Sample', color: '#D29922', bg: 'rgba(210,153,34,0.12)' },
+  unavailable: { label: 'Unavailable', color: '#F85149', bg: 'rgba(248,81,73,0.12)' },
+};
+
 interface SongCardProps {
   song: Song;
   isActive?: boolean;
@@ -18,15 +24,26 @@ function formatDuration(ms: number) {
 }
 
 export function SongCard({ song, isActive = false, isPlaying = false, isLiked = false, onPlay, onLike }: SongCardProps) {
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      onPlay();
+    }
+  };
+
   return (
     <div
-      className="group relative flex flex-col overflow-hidden rounded-2xl border transition-all duration-300 cursor-pointer"
+      className="group relative flex flex-col overflow-hidden rounded-2xl border transition-all duration-300 cursor-pointer song-card"
       style={{
         background: isActive ? 'rgba(29,185,84,0.08)' : 'rgba(40,40,40,0.6)',
         borderColor: isActive ? 'rgba(29,185,84,0.4)' : 'rgba(255,255,255,0.08)',
         boxShadow: isActive ? '0 0 20px rgba(29,185,84,0.15)' : 'none',
       }}
       onClick={onPlay}
+      onKeyDown={handleKeyDown}
+      tabIndex={0}
+      role="button"
+      aria-label={`${isActive && isPlaying ? 'Pause' : 'Play'} ${song.title} by ${song.artist}`}
     >
       {/* Cover art */}
       <div className="relative aspect-square overflow-hidden">
@@ -45,13 +62,15 @@ export function SongCard({ song, isActive = false, isPlaying = false, isLiked = 
         <button
           type="button"
           onClick={(e) => { e.stopPropagation(); onPlay(); }}
-          className="absolute bottom-3 right-3 flex h-11 w-11 items-center justify-center rounded-full text-white shadow-lg transition-all duration-200 opacity-0 group-hover:opacity-100 hover:scale-110 active:scale-95"
+          className="play-btn absolute bottom-3 right-3 flex h-11 w-11 items-center justify-center rounded-full text-white shadow-lg opacity-0 group-hover:opacity-100"
           style={{
-            background: '#1DB954',
-            boxShadow: '0 4px 20px rgba(29,185,84,0.5)',
+            background: song.playbackStatus === 'unavailable' ? 'rgba(255,255,255,0.15)' : '#1DB954',
+            boxShadow: song.playbackStatus === 'unavailable' ? 'none' : '0 4px 20px rgba(29,185,84,0.5)',
             opacity: isActive ? 1 : undefined,
+            cursor: song.playbackStatus === 'unavailable' ? 'not-allowed' : 'pointer',
           }}
-          aria-label={isActive && isPlaying ? 'Pause' : 'Play'}
+          aria-label={song.playbackStatus === 'unavailable' ? 'Track not available' : isActive && isPlaying ? 'Pause' : 'Play'}
+          disabled={song.playbackStatus === 'unavailable'}
         >
           {isActive && isPlaying
             ? <Pause size={18} fill="white" />
@@ -81,12 +100,23 @@ export function SongCard({ song, isActive = false, isPlaying = false, isLiked = 
       <div className="flex flex-1 flex-col gap-1 p-3">
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0 flex-1">
-            <p
-              className="truncate text-sm font-bold leading-tight"
-              style={{ color: isActive ? '#1DB954' : '#fff' }}
-            >
-              {song.title}
-            </p>
+            <div className="flex items-center gap-1.5">
+              <p
+                className="truncate text-sm font-bold leading-tight"
+                style={{ color: isActive ? '#1DB954' : '#fff' }}
+              >
+                {song.title}
+              </p>
+              {song.playbackStatus && STATUS_CONFIG[song.playbackStatus] && (
+                <span
+                  className="hidden flex-shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold sm:inline-flex"
+                  style={{ color: STATUS_CONFIG[song.playbackStatus].color, background: STATUS_CONFIG[song.playbackStatus].bg }}
+                >
+                  <span style={{ width: 5, height: 5, borderRadius: '50%', background: STATUS_CONFIG[song.playbackStatus].color }} />
+                  {STATUS_CONFIG[song.playbackStatus].label}
+                </span>
+              )}
+            </div>
             <p className="mt-0.5 truncate text-xs" style={{ color: 'rgba(255,255,255,0.55)' }}>
               {song.artist}
             </p>

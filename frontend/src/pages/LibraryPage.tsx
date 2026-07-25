@@ -129,7 +129,7 @@ export function LibraryPage() {
                   return (
                     <motion.div
                       key={song.id}
-                      className="flex items-center gap-3 rounded-xl px-4 py-3 cursor-pointer transition-all"
+                      className="song-card flex items-center gap-3 rounded-xl px-4 py-3 cursor-pointer"
                       style={{
                         background: active ? 'rgba(29,185,84,0.08)' : 'rgba(40,40,40,0.5)',
                         border: `1px solid ${active ? 'rgba(29,185,84,0.25)' : 'rgba(255,255,255,0.05)'}`,
@@ -138,6 +138,15 @@ export function LibraryPage() {
                       animate={{ opacity: 1, x: 0 }}
                       transition={{ delay: i * 0.03 }}
                       onClick={() => active ? togglePlay() : playSong(song, list)}
+                      tabIndex={0}
+                      role="button"
+                      aria-label={`${active && isPlaying ? 'Pause' : 'Play'} ${song.title} by ${song.artist}`}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          active ? togglePlay() : playSong(song, list);
+                        }
+                      }}
                     >
                       <div className="relative h-11 w-11 flex-shrink-0 overflow-hidden rounded-lg">
                         <img src={song.coverUrl} alt="" className="h-full w-full object-cover" />
@@ -165,7 +174,7 @@ export function LibraryPage() {
                       </button>
                       <button
                         onClick={e => { e.stopPropagation(); active ? togglePlay() : playSong(song, list); }}
-                        className="flex h-8 w-8 items-center justify-center rounded-full text-black transition hover:scale-105"
+                        className="play-btn flex h-8 w-8 items-center justify-center rounded-full text-black transition hover:scale-105"
                         style={{ background: ACCENT }}
                       >
                         {active && isPlaying ? <Pause size={12} fill="currentColor" /> : <Play size={12} fill="currentColor" />}
@@ -293,9 +302,18 @@ export function LibraryPage() {
                               const active = currentSong?.id === song.id;
                               return (
                                 <div key={song.id}
-                                  className="flex items-center gap-3 rounded-xl px-3 py-2.5 cursor-pointer transition-all"
+                                  className="song-card flex items-center gap-3 rounded-xl px-3 py-2.5 cursor-pointer"
                                   style={{ background: active ? 'rgba(29,185,84,0.06)' : 'transparent' }}
                                   onClick={() => active ? togglePlay() : playSong(song, openPlaylist.songs)}
+                                  tabIndex={0}
+                                  role="button"
+                                  aria-label={`${active && isPlaying ? 'Pause' : 'Play'} ${song.title} by ${song.artist}`}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter' || e.key === ' ') {
+                                      e.preventDefault();
+                                      active ? togglePlay() : playSong(song, openPlaylist.songs);
+                                    }
+                                  }}
                                 >
                                   <span className="text-xs text-white/25 w-4">{i + 1}</span>
                                   <img src={song.coverUrl} alt="" className="h-10 w-10 rounded-lg object-cover flex-shrink-0" />

@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { AudioProvider, useAudio } from './context/AudioContext';
 import { PlayerBar } from './components/PlayerBar';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { LoginPage } from './pages/LoginPage';
 import { HomePage } from './pages/HomePage';
 import { SearchPage } from './pages/SearchPage';
@@ -93,13 +94,13 @@ function Dashboard({ user, email, onLogout }: { user: string; email: string; onL
 
       {/* ── Sidebar ── */}
       <motion.aside
-        className={`fixed left-0 top-0 z-50 flex h-screen flex-shrink-0 flex-col transition-transform duration-300 lg:sticky ${sidebarOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}`}
+        className={`fixed left-0 top-0 z-50 flex h-screen flex-shrink-0 flex-col overflow-y-auto transition-transform duration-300 lg:sticky ${sidebarOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}`}
         style={{
           width: '246px',
           background: BG_SIDEBAR,
           borderRight: '1px solid rgba(29,185,84,0.08)',
           backdropFilter: 'blur(24px)',
-          paddingBottom: currentSong ? '80px' : '0px',
+          paddingBottom: currentSong ? '96px' : '0px',
         }}
         initial={{ x: -246, opacity: 0 }}
         animate={{ x: 0, opacity: 1 }}
@@ -146,7 +147,7 @@ function Dashboard({ user, email, onLogout }: { user: string; email: string; onL
         </div>
 
         {/* Nav items */}
-        <nav className="flex flex-col gap-0.5 px-3">
+        <nav className="flex flex-col gap-0.5 px-3" aria-label="Main menu">
           {NAV_ITEMS.map(({ id, label, icon: Icon }) => (
             <motion.button
               key={id}
@@ -332,22 +333,24 @@ function Dashboard({ user, email, onLogout }: { user: string; email: string; onL
         {/* Scrollable page content */}
         <main className="flex-1 overflow-y-auto" style={{ paddingBottom: '96px' }}>
           <div className="mx-auto w-full max-w-[1480px] px-5 pb-6 lg:px-8">
-            <AnimatePresence mode="wait">
-              <motion.div
-                key={tab}
-                initial={{ opacity: 0, y: 14 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -8 }}
-                transition={{ duration: 0.28 }}
-              >
-                {tab === 'home'     && <HomePage user={user} />}
-                {tab === 'search'   && <SearchPage />}
-                {tab === 'trending' && <TrendingPage />}
-                {tab === 'library'  && <LibraryPage />}
-                {tab === 'artists'  && <ArtistsPage />}
-                {tab === 'settings' && <SettingsPage />}
-              </motion.div>
-            </AnimatePresence>
+            <ErrorBoundary>
+              <AnimatePresence mode="wait">
+                <motion.div
+                  key={tab}
+                  initial={{ opacity: 0, y: 14 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -8 }}
+                  transition={{ duration: 0.28 }}
+                >
+                  {tab === 'home'     && <HomePage user={user} />}
+                  {tab === 'search'   && <SearchPage />}
+                  {tab === 'trending' && <TrendingPage />}
+                  {tab === 'library'  && <LibraryPage />}
+                  {tab === 'artists'  && <ArtistsPage />}
+                  {tab === 'settings' && <SettingsPage />}
+                </motion.div>
+              </AnimatePresence>
+            </ErrorBoundary>
           </div>
         </main>
       </div>
@@ -408,6 +411,26 @@ function AppContent() {
     if (handledAuthRef.current) return;
 
     const params = new URLSearchParams(window.location.search);
+
+    const verifyToken = params.get('verify');
+    if (verifyToken) {
+      handledAuthRef.current = true;
+      void (async () => {
+        try {
+          const { verifyEmail } = await import('./api/client');
+          const data = await verifyEmail(verifyToken);
+          localStorage.setItem('musify_token', data.token);
+          localStorage.setItem('musify_current_user', JSON.stringify({ email: data.user.username, name: data.user.displayName }));
+          setFallbackUser({ name: data.user.displayName || data.user.username, email: data.user.username });
+        } catch {
+          setAuthError('Email verification failed or the link has expired.');
+        } finally {
+          window.history.replaceState({}, '', window.location.pathname);
+        }
+      })();
+      return;
+    }
+
     const code = params.get('code');
     const state = params.get('state');
     const error = params.get('error');

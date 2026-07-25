@@ -5,3 +5,6 @@ __pycache__/
 *.db
 dist/
 build/
+
+.claude/
+backend/local_db.json

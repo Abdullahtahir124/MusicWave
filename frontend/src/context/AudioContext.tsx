@@ -3,6 +3,8 @@ import { useToast } from '../store/toastStore';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
+export type PlaybackStatus = 'available' | 'preview' | 'unavailable';
+
 export interface Song {
   id: string;
   title: string;
@@ -13,6 +15,7 @@ export interface Song {
   audioUrl: string | null;
   duration: number;
   previewAvailable?: boolean;
+  playbackStatus?: PlaybackStatus;
   isPreview?: boolean;
   matchScore?: number;
 }
@@ -32,6 +35,7 @@ export interface Playlist {
 
 interface AudioContextType {
   currentSong: Song | null;
+  currentPlaybackTier: PlaybackStatus | null;
   isPlaying: boolean;
   duration: number;
   currentTime: number;
@@ -191,9 +195,12 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
   }, []);
 
   const playSong = (song: Song, queue: Song[] = []) => {
+    if (song.playbackStatus === 'unavailable' && !song.audioUrl) {
+      try { addToast('This track is not available for playback', 'error'); } catch { }
+      return;
+    }
     try { console.log('playSong called', { id: song.id, title: song.title, audioUrl: song.audioUrl }); } catch { }
     try {
-      // expose a global counter for debugging in the browser console
       (window as any).__lastPlayCall = { id: song.id, title: song.title, audioUrl: song.audioUrl, ts: Date.now() };
       (window as any).__playSongCalls = ((window as any).__playSongCalls || 0) + 1;
     } catch { }
@@ -302,7 +309,8 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
                 removeToast(loadingToastRef.current);
                 loadingToastRef.current = null;
               }
-              addToast(`Now playing: ${song.title}`, 'success');
+              const tierLabel = song.playbackStatus === 'preview' ? ' (sample audio)' : '';
+              addToast(`Now playing: ${song.title}${tierLabel}`, 'success');
             } catch { }
           }).catch(err => {
             // eslint-disable-next-line no-console
@@ -471,7 +479,8 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
 
   return (
     <AudioCtx.Provider value={{
-      currentSong, isPlaying, duration, currentTime, volume, playbackRate,
+      currentSong, currentPlaybackTier: currentSong?.playbackStatus ?? null,
+      isPlaying, duration, currentTime, volume, playbackRate,
       analyser: null, likedSongs, recentPlays, playHistory,
       playSong, togglePlay, seek, setVolumeLevel, setPlaybackRate, nextTrack, prevTrack, toggleLike,
       playlists, createPlaylist, addSongToPlaylist,

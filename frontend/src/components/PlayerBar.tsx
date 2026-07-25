@@ -65,7 +65,7 @@ export const PlayerBar = () => {
 
   return (
     <div
-      className="fixed bottom-0 left-0 right-0 z-50 flex items-center justify-between gap-4 px-4 py-3 lg:px-6"
+      className="fixed bottom-0 left-0 right-0 z-50 flex items-center justify-between gap-4 px-4 py-3 lg:left-[246px] lg:px-6"
       style={{
         background: 'rgba(18,18,18,0.96)',
         backdropFilter: 'blur(24px)',
@@ -91,7 +91,25 @@ export const PlayerBar = () => {
           )}
         </div>
         <div className="min-w-0">
-          <p className="truncate text-sm font-semibold text-white">{currentSong.title}</p>
+          <div className="flex items-center gap-2">
+            <p className="truncate text-sm font-semibold text-white">{currentSong.title}</p>
+            {currentSong.playbackStatus === 'preview' && (
+              <span
+                className="hidden flex-shrink-0 rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide sm:inline-block"
+                style={{ background: 'rgba(210,153,34,0.15)', color: '#D29922' }}
+              >
+                Sample
+              </span>
+            )}
+            {currentSong.playbackStatus === 'available' && currentSong.previewAvailable && (
+              <span
+                className="hidden flex-shrink-0 rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide sm:inline-block"
+                style={{ background: 'rgba(29,185,84,0.15)', color: '#1DB954' }}
+              >
+                30s Preview
+              </span>
+            )}
+          </div>
           <p className="truncate text-xs text-white/50">{currentSong.artist}</p>
         </div>
         <button
@@ -191,7 +209,7 @@ export const PlayerBar = () => {
         </div>
 
         {/* Volume */}
-        <button onClick={handleMute} className="text-white/50 transition hover:text-white">
+        <button onClick={handleMute} className="text-white/50 transition hover:text-white" aria-label={muted ? 'Unmute' : 'Mute'}>
           {muted || volume === 0 ? <VolumeX size={17} /> : <Volume2 size={17} />}
         </button>
         <div

@@ -14,6 +14,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+import urllib.parse
+
 from backend.db import (
     add_song_to_playlist,
     analytics_summary,
@@ -33,11 +35,13 @@ from backend.db import (
     load_playback_state,
     record_recent_play,
     reorder_playlist_track,
+    resend_verification,
     revoke_token,
     remove_song_from_playlist,
     save_playback_state,
     toggle_favorite,
     update_playlist,
+    verify_user_email,
 )
 
 # Load .env from the backend/ directory
@@ -75,6 +79,38 @@ SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 
 # Cached token — avoids fetching a new one on every request
 _token_cache: dict = {"token": "", "expires_at": 0.0}
+
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
+_resend_rate: dict = {}
+
+async def _send_verification_email(to_email: str, token: str) -> None:
+    if not RESEND_API_KEY:
+        return
+    verify_url = f"{FRONTEND_URL}?verify={urllib.parse.quote(token)}"
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+            json={
+                "from": "MusicWave <noreply@yourdomain.com>",
+                "to": [to_email],
+                "subject": "Verify your MusicWave account",
+                "html": (
+                    '<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px;'
+                    'background:#181818;border-radius:12px;color:#fff">'
+                    '<h1 style="color:#1DB954;font-size:24px;margin:0 0 16px">MusicWave</h1>'
+                    '<p style="margin:0 0 24px;color:#ccc">Click the button below to verify your email address and activate your account.</p>'
+                    f'<a href="{verify_url}" style="display:inline-block;padding:12px 32px;'
+                    'background:#1DB954;color:#000;font-weight:700;border-radius:24px;text-decoration:none">'
+                    'Verify Email</a>'
+                    '<p style="margin:24px 0 0;font-size:12px;color:#888">This link expires in 24 hours.</p>'
+                    '</div>'
+                ),
+            },
+            timeout=10,
+        )
 
 # Fallback cover pool (used when Spotify is offline)
 COVER_POOL = [
@@ -116,7 +152,16 @@ class Song(BaseModel):
     audioUrl: Optional[str]
     duration: int
     previewAvailable: bool = False
+    playbackStatus: str = "unavailable"
     features: Optional[AudioFeatures] = None
+
+
+def _classify_playback(audio_url: Optional[str], from_api: bool) -> str:
+    if not audio_url:
+        return "unavailable"
+    if from_api:
+        return "available"
+    return "preview"
 
 class Recommendation(Song):
     matchScore: float
@@ -225,9 +270,10 @@ def _row_to_song_payload(row: Any, index: int) -> Song:
         album=str(_row_get(row, 'album_name', _row_get(row, 'album', ''))),
         genre=str(_row_get(row, 'track_genre', _row_get(row, 'genre', ''))),
         coverUrl=COVER_POOL[index % len(COVER_POOL)],
-        audioUrl=AUDIO_POOL[index % len(AUDIO_POOL)],
+        audioUrl=None,
         duration=int(float(_row_get(row, 'duration_ms', _row_get(row, 'duration', 180_000)) or 180_000)),
-        previewAvailable=True,
+        previewAvailable=False,
+        playbackStatus='unavailable',
     )
 
 
@@ -330,8 +376,6 @@ def _track_to_song(t: dict, index: int = 0) -> Song:
     preview = t.get("preview_url")
     images = t.get("album", {}).get("images", [])
     cover = images[0]["url"] if images else COVER_POOL[index % len(COVER_POOL)]
-    # Always assign a playable audioUrl — fall back to SoundHelix if no Spotify preview
-    audio_url = preview if preview else AUDIO_POOL[index % len(AUDIO_POOL)]
     return Song(
         id=t["id"],
         title=t["name"],
@@ -339,9 +383,29 @@ def _track_to_song(t: dict, index: int = 0) -> Song:
         album=t.get("album", {}).get("name", ""),
         genre="",
         coverUrl=cover,
-        audioUrl=audio_url,
+        audioUrl=preview,
         duration=t.get("duration_ms", 0),
-        previewAvailable=True,
+        previewAvailable=bool(preview),
+        playbackStatus="available" if preview else "unavailable",
+    )
+
+
+def _deezer_to_song(t: dict) -> Song:
+    """Convert a Deezer track object to our Song model."""
+    preview = t.get("preview")
+    album = t.get("album", {})
+    artist = t.get("artist", {})
+    return Song(
+        id=f"dz-{t['id']}",
+        title=t.get("title", "Unknown"),
+        artist=artist.get("name", "Unknown"),
+        album=album.get("title", ""),
+        genre="",
+        coverUrl=album.get("cover_medium") or album.get("cover_big") or artist.get("picture_medium") or COVER_POOL[0],
+        audioUrl=preview,
+        duration=int(t.get("duration", 30)) * 1000,
+        previewAvailable=bool(preview),
+        playbackStatus="available" if preview else "unavailable",
     )
 
 
@@ -405,80 +469,67 @@ async def health_check():
 
 @app.get('/api/featured')
 async def featured_tracks(limit: int = 12):
-    """Return featured tracks from the local CSV catalog with guaranteed audio URLs."""
+    """Return featured tracks — prefers Deezer chart for real playable previews."""
     safe_limit = min(max(limit, 1), 20)
-    rows = _get_df()
-    if rows is None:
-        # Return static fallback songs if CSV not loaded
-        fallback = []
-        for i in range(safe_limit):
-            fallback.append({
-                'id': f'static-{i+1}',
-                'title': ['Blinding Lights', 'Levitating', 'Stay', 'Bad Habits', 'Peaches',
-                           'Good 4 U', 'Montero', 'Kiss Me More', 'Leave The Door Open',
-                           'Butter', 'Dynamite', 'Watermelon Sugar', 'Mood', 'Drivers License',
-                           'Positions', 'Save Your Tears', 'Deja Vu', 'Telepatia', 'Build a Bitch',
-                           'Masterpiece'][i % 20],
-                'artist': ['The Weeknd', 'Dua Lipa', 'The Kid LAROI', 'Ed Sheeran', 'Justin Bieber',
-                           'Olivia Rodrigo', 'Lil Nas X', 'Doja Cat', 'Bruno Mars', 'BTS',
-                           'BTS', 'Harry Styles', '24kGoldn', 'Olivia Rodrigo', 'Ariana Grande',
-                           'The Weeknd', 'Olivia Rodrigo', 'Kali Uchis', 'Bella Poarch', 'SZA'][i % 20],
-                'album': 'Featured',
-                'genre': ['Pop', 'Pop', 'Hip-Hop', 'Pop', 'R&B', 'Pop', 'Hip-Hop', 'R&B', 'R&B', 'K-Pop',
-                          'K-Pop', 'Pop', 'Hip-Hop', 'Pop', 'Pop', 'Pop', 'Pop', 'R&B', 'Pop', 'R&B'][i % 20],
-                'coverUrl': COVER_POOL[i % len(COVER_POOL)],
-                'audioUrl': AUDIO_POOL[i % len(AUDIO_POOL)],
-                'duration': 200000 + (i * 10000),
-                'previewAvailable': True,
-            })
-        return {'results': fallback[:safe_limit]}
 
-    # Use first N rows from CSV
-    row_list = rows if isinstance(rows, list) else list(rows)
-    selected = row_list[:safe_limit]
-    songs = [_row_to_song_payload(row, i).model_dump() for i, row in enumerate(selected)]
-    return {'results': songs}
+    # Try Deezer chart for real songs with playable 30-sec previews
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://api.deezer.com/chart/0/tracks",
+                params={"limit": safe_limit},
+                timeout=10,
+            )
+        if resp.status_code == 200:
+            items = resp.json().get("data", [])
+            if items:
+                return {'results': [_deezer_to_song(t).dict() for t in items[:safe_limit]]}
+    except Exception as exc:
+        print(f"[backend] Deezer chart failed for featured: {exc}")
+
+    # Fall back to local CSV (no audio, but shows song info)
+    rows = _get_df()
+    if rows is not None:
+        row_list = rows if isinstance(rows, list) else list(rows)
+        songs = [_row_to_song_payload(row, i).dict() for i, row in enumerate(row_list[:safe_limit])]
+        return {'results': songs}
+
+    return {'results': []}
 
 
 @app.get('/api/trending')
 async def trending_tracks(limit: int = 20):
-    """Return top trending tracks sorted by popularity from the local CSV catalog."""
+    """Return top trending tracks — prefers Deezer chart for real playable previews."""
     safe_limit = min(max(limit, 1), 50)
+
+    # Try Deezer chart for real songs with playable 30-sec previews
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://api.deezer.com/chart/0/tracks",
+                params={"limit": safe_limit},
+                timeout=10,
+            )
+        if resp.status_code == 200:
+            items = resp.json().get("data", [])
+            if items:
+                return {'results': [_deezer_to_song(t).dict() for t in items[:safe_limit]]}
+    except Exception as exc:
+        print(f"[backend] Deezer chart failed for trending: {exc}")
+
+    # Fall back to local CSV sorted by popularity
     rows = _get_df()
-    if rows is None:
-        fallback = []
-        for i in range(safe_limit):
-            fallback.append({
-                'id': f'static-{i+1}',
-                'title': ['Blinding Lights', 'Levitating', 'Stay', 'Bad Habits', 'Peaches',
-                           'Good 4 U', 'Montero', 'Kiss Me More', 'Leave The Door Open',
-                           'Butter', 'Dynamite', 'Watermelon Sugar', 'Mood', 'Drivers License',
-                           'Positions', 'Save Your Tears', 'Deja Vu', 'Telepatia', 'Build a Bitch',
-                           'Masterpiece'][i % 20],
-                'artist': ['The Weeknd', 'Dua Lipa', 'The Kid LAROI', 'Ed Sheeran', 'Justin Bieber',
-                           'Olivia Rodrigo', 'Lil Nas X', 'Doja Cat', 'Bruno Mars', 'BTS',
-                           'BTS', 'Harry Styles', '24kGoldn', 'Olivia Rodrigo', 'Ariana Grande',
-                           'The Weeknd', 'Olivia Rodrigo', 'Kali Uchis', 'Bella Poarch', 'SZA'][i % 20],
-                'album': 'Featured',
-                'genre': ['Pop', 'Pop', 'Hip-Hop', 'Pop', 'R&B', 'Pop', 'Hip-Hop', 'R&B', 'R&B', 'K-Pop',
-                           'K-Pop', 'Pop', 'Hip-Hop', 'Pop', 'Pop', 'Pop', 'Pop', 'R&B', 'Pop', 'R&B'][i % 20],
-                'coverUrl': COVER_POOL[i % len(COVER_POOL)],
-                'audioUrl': AUDIO_POOL[i % len(AUDIO_POOL)],
-                'duration': 200000 + (i * 10000),
-                'previewAvailable': True,
-            })
-        return {'results': fallback[:safe_limit]}
+    if rows is not None:
+        def get_pop(r):
+            try:
+                return int(float(_row_get(r, 'popularity', 0)))
+            except Exception:
+                return 0
+        sorted_rows = sorted(rows, key=get_pop, reverse=True)
+        songs = [_row_to_song_payload(row, i).dict() for i, row in enumerate(sorted_rows[:safe_limit])]
+        return {'results': songs}
 
-    def get_pop(r):
-        try:
-            return int(float(_row_get(r, 'popularity', 0)))
-        except Exception:
-            return 0
-
-    sorted_rows = sorted(rows, key=get_pop, reverse=True)
-    selected = sorted_rows[:safe_limit]
-    songs = [_row_to_song_payload(row, i).model_dump() for i, row in enumerate(selected)]
-    return {'results': songs}
+    return {'results': []}
 
 
 @app.get('/api/artists')
@@ -507,7 +558,7 @@ async def api_artists(limit: int = 50):
             }
         
         if len(artist_map[primary_artist]['songs']) < 5:
-            artist_map[primary_artist]['songs'].append(_row_to_song_payload(row, i).model_dump())
+            artist_map[primary_artist]['songs'].append(_row_to_song_payload(row, i).dict())
             
     sorted_artists = sorted(artist_map.values(), key=lambda a: a['popularity'], reverse=True)
     
@@ -538,16 +589,38 @@ async def api_artists(limit: int = 50):
 
 
 @app.get("/api/search", response_model=SearchResponse)
-async def search_songs(q: str = Query(..., min_length=2)):
-    # ── Spotify path ────────────────────────────────────────────────────────
+async def search_songs(
+    q: str = Query(default="", min_length=0),
+    genre: str = Query(default=""),
+    artist: str = Query(default=""),
+):
+    effective_q = q.strip() or genre.strip() or artist.strip()
+    if len(effective_q) < 2:
+        return SearchResponse(results=[])
+
+    # ── Deezer first — free, no credentials, reliable 30-sec previews ──────
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://api.deezer.com/search",
+                params={"q": effective_q, "limit": 50},
+                timeout=10,
+            )
+        if resp.status_code == 200:
+            items = resp.json().get("data", [])
+            if items:
+                return SearchResponse(results=[_deezer_to_song(t) for t in items])
+    except Exception as exc:
+        print(f"[backend] Deezer search failed: {exc}")
+
+    # ── Spotify fallback (if configured) ───────────────────────────────────
     if _spotify_enabled():
         try:
             token = await _get_token()
             async with httpx.AsyncClient() as client:
                 resp = await client.get(
                     "https://api.spotify.com/v1/search",
-                    # Request 20 results so the UI has plenty to show
-                    params={"q": q, "type": "track", "limit": 20, "market": "US"},
+                    params={"q": effective_q, "type": "track", "limit": 50, "market": "US"},
                     headers=_auth_header(token),
                     timeout=10,
                 )
@@ -556,7 +629,6 @@ async def search_songs(q: str = Query(..., min_length=2)):
                 results: List[Song] = []
                 for t in items:
                     song = _track_to_song(t)
-                    # Fetch genre from first artist (best-effort, skip on error)
                     if t.get("artists"):
                         try:
                             song.genre = await _fetch_artist_genre(t["artists"][0]["id"], token)
@@ -565,46 +637,16 @@ async def search_songs(q: str = Query(..., min_length=2)):
                     results.append(song)
                 return SearchResponse(results=results)
         except Exception as exc:
-            print(f"[backend] Spotify search failed: {exc} — falling back to CSV")
-
-    # ── Deezer Fallback when Spotify is disabled ──────────────────────────────
-    if not _spotify_enabled():
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    "https://api.deezer.com/search",
-                    params={"q": q, "limit": 20},
-                    timeout=10,
-                )
-            if resp.status_code == 200:
-                items = resp.json().get("data", [])
-                results: List[Song] = []
-                for i, t in enumerate(items):
-                    results.append(Song(
-                        id=f"dz-{t['id']}",
-                        title=t["title"],
-                        artist=t["artist"]["name"],
-                        album=t["album"]["title"],
-                        genre="Pop",
-                        coverUrl=t["album"]["cover_medium"],
-                        audioUrl=t["preview"],
-                        duration=t["duration"] * 1000,
-                        previewAvailable=True,
-                    ))
-                if results:
-                    return SearchResponse(results=results)
-        except Exception as exc:
-            print(f"[backend] Deezer search failed: {exc} — falling back to CSV")
+            print(f"[backend] Spotify search failed: {exc}")
 
     # ── Local CSV fallback ───────────────────────────────────────────────────
     rows = _get_df()
     if not rows:
         return SearchResponse(results=[])
 
-    filters = SearchFilters(q=q)
-    matches = _filter_rows(rows, filters)[:20]
-    results = [_row_to_song_payload(row, index) for index, row in enumerate(matches)]
-    return SearchResponse(results=results)
+    filters = SearchFilters(q=effective_q)
+    matches = _filter_rows(rows, filters)[:50]
+    return SearchResponse(results=[_row_to_song_payload(row, i) for i, row in enumerate(matches)])
 
 
 @app.get("/api/track/{track_id}", response_model=TrackResponse)
@@ -729,7 +771,7 @@ async def recommend_songs(songId: str, limit: int = 5):
                                 t["artists"][0]["id"], token
                             )
                         song.features = feat
-                        recs.append(Recommendation(**song.model_dump(), matchScore=round(score, 4)))
+                        recs.append(Recommendation(**song.dict(), matchScore=round(score, 4)))
                     if recs:
                         return RecommendationResponse(recommendations=recs)
         except Exception as exc:
@@ -779,20 +821,30 @@ async def proxy(url: str = Query(...)):
     return Response(content=resp.content, media_type=content_type)
 
 
-@app.post('/api/auth/register', response_model=AuthResponse)
+class RegisterResponse(BaseModel):
+    message: str = ""
+    requiresVerification: bool = False
+    token: str = ""
+    user: Optional[dict[str, Any]] = None
+
+
+class ResendVerificationRequest(BaseModel):
+    username: str
+
+
+@app.post('/api/auth/register')
 async def register(payload: AuthRequest):
     username = payload.username.strip()
     if not username:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Username is required.')
 
-    # Accept both plain usernames and email addresses
     if len(username) < 3:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Username must be at least 3 characters.')
 
+    requires_verification = bool(RESEND_API_KEY)
+
     try:
-        user = create_user(username, payload.password, payload.displayName)
-        token = issue_token(user['id'])
-        return AuthResponse(token=token, user=user)
+        user = create_user(username, payload.password, payload.displayName, skip_verification=not requires_verification)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except Exception as exc:
@@ -804,11 +856,59 @@ async def register(payload: AuthRequest):
             ) from exc
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f'Registration failed: {err_msg}') from exc
 
+    if requires_verification:
+        try:
+            await _send_verification_email(username, user["verification_token"])
+        except Exception as exc:
+            print(f"[backend] Email send failed: {exc}")
+        return {
+            "message": "Check your email for a verification link",
+            "requiresVerification": True,
+        }
+
+    token = issue_token(user['id'])
+    return AuthResponse(token=token, user=user)
+
+
+@app.get('/api/auth/verify')
+async def verify_email_endpoint(token: str = Query(...)):
+    try:
+        user = verify_user_email(token)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Invalid or expired verification token')
+    auth_token = issue_token(user['id'])
+    return AuthResponse(token=auth_token, user=user)
+
+
+@app.post('/api/auth/resend-verification')
+async def resend_verification_endpoint(payload: ResendVerificationRequest):
+    username = payload.username.strip().lower()
+    now = time.time()
+    last_sent = _resend_rate.get(username, 0.0)
+    if now - last_sent < 60:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail='Please wait 60 seconds before requesting another verification email')
+
+    new_token = resend_verification(username)
+    if not new_token:
+        return {"message": "If an unverified account exists, a new verification email has been sent."}
+
+    _resend_rate[username] = now
+    try:
+        await _send_verification_email(username, new_token)
+    except Exception as exc:
+        print(f"[backend] Resend email failed: {exc}")
+
+    return {"message": "If an unverified account exists, a new verification email has been sent."}
+
 
 @app.post('/api/auth/login', response_model=AuthResponse)
 async def login(payload: AuthRequest):
     try:
         user = authenticate_user(payload.username, payload.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     except Exception as exc:
         err_msg = str(exc)
         if 'ServerSelectionTimeoutError' in err_msg or 'timed out' in err_msg.lower() or 'connection' in err_msg.lower():
@@ -845,85 +945,68 @@ async def advanced_search(
     mood: str = '',
     minDuration: int = 0,
     maxDuration: int = 0,
-    limit: int = 20,
+    limit: int = 50,
 ):
     search_limit = _normalize_limit(limit, maximum=50)
     filters = SearchFilters(
-        q=q,
-        artist=artist,
-        album=album,
-        genre=genre,
-        mood=mood,
-        minDuration=max(0, minDuration),
-        maxDuration=max(0, maxDuration),
+        q=q, artist=artist, album=album, genre=genre, mood=mood,
+        minDuration=max(0, minDuration), maxDuration=max(0, maxDuration),
         limit=search_limit,
     )
 
-    if _spotify_enabled() and filters.q.strip():
+    effective_q = filters.q.strip() or filters.genre.strip() or filters.artist.strip()
+    if not effective_q:
+        return SearchResponse(results=[])
+
+    # ── Deezer first — free, no credentials, reliable 30-sec previews ──────
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://api.deezer.com/search",
+                params={"q": effective_q, "limit": search_limit},
+                timeout=10,
+            )
+        if resp.status_code == 200:
+            items = resp.json().get("data", [])
+            results: list[Song] = []
+            for t in items:
+                song = _deezer_to_song(t)
+                if filters.artist and filters.artist.lower() not in song.artist.lower():
+                    continue
+                if filters.album and filters.album.lower() not in song.album.lower():
+                    continue
+                results.append(song)
+            if results:
+                return SearchResponse(results=results[:search_limit])
+    except Exception as exc:
+        print(f"[backend] Deezer advanced search failed: {exc}")
+
+    # ── Spotify fallback (if configured) ───────────────────────────────────
+    if _spotify_enabled():
         try:
             token = await _get_token()
             async with httpx.AsyncClient() as client:
                 resp = await client.get(
                     'https://api.spotify.com/v1/search',
-                    params={'q': filters.q, 'type': 'track', 'limit': search_limit, 'market': 'US'},
+                    params={'q': effective_q, 'type': 'track', 'limit': search_limit, 'market': 'US'},
                     headers=_auth_header(token),
                     timeout=10,
                 )
             if resp.status_code == 200:
                 items = resp.json().get('tracks', {}).get('items', [])
-                results: list[Song] = []
+                results = []
                 for item in items:
                     song = _track_to_song(item)
                     if filters.artist and filters.artist.lower() not in song.artist.lower():
                         continue
                     if filters.album and filters.album.lower() not in song.album.lower():
                         continue
-                    if filters.genre and filters.genre.lower() not in song.genre.lower():
-                        continue
                     results.append(song)
                 return SearchResponse(results=results[:search_limit])
         except Exception as exc:
-            print(f'[backend] advanced Spotify search failed: {exc} — falling back to CSV')
+            print(f'[backend] advanced Spotify search failed: {exc}')
 
-    # ── Deezer Fallback when Spotify is disabled ──────────────────────────────
-    if not _spotify_enabled() and (filters.q.strip() or filters.genre.strip()):
-        try:
-            query_str = filters.q.strip() or filters.genre.strip()
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    "https://api.deezer.com/search",
-                    params={"q": query_str, "limit": search_limit},
-                    timeout=10,
-                )
-            if resp.status_code == 200:
-                items = resp.json().get("data", [])
-                results: list[Song] = []
-                for t in items:
-                    song = Song(
-                        id=f"dz-{t['id']}",
-                        title=t["title"],
-                        artist=t["artist"]["name"],
-                        album=t["album"]["title"],
-                        genre=filters.genre or "Pop",
-                        coverUrl=t["album"].get("cover_medium") or t["artist"].get("picture_medium") or COVER_POOL[0],
-                        audioUrl=t.get("preview") or AUDIO_POOL[0],
-                        duration=int(t.get("duration", 30)) * 1000,
-                        previewAvailable=bool(t.get("preview")),
-                    )
-                    if filters.artist and filters.artist.lower() not in song.artist.lower():
-                        continue
-                    if filters.album and filters.album.lower() not in song.album.lower():
-                        continue
-                    results.append(song)
-                if results:
-                    return SearchResponse(results=results)
-        except Exception as exc:
-            print(f"[backend] advanced Deezer search failed: {exc} — falling back to CSV")
-                if results:
-                    return SearchResponse(results=results)
-        except Exception as exc:
-            print(f"[backend] advanced Deezer search failed: {exc} — falling back to CSV")
-
+    # ── Local CSV fallback ─────────────────────────────────────────────────
     df = _get_df()
     if not df:
         return SearchResponse(results=[])
@@ -932,11 +1015,7 @@ async def advanced_search(
     if not filtered:
         return SearchResponse(results=[])
 
-    results = [
-        _row_to_song_payload(row, index)
-        for index, row in enumerate(filtered[:search_limit])
-    ]
-    return SearchResponse(results=results)
+    return SearchResponse(results=[_row_to_song_payload(row, i) for i, row in enumerate(filtered[:search_limit])])
 
 
 @app.get('/api/playlists')

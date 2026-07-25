@@ -4,6 +4,23 @@ import { MOCK_SONGS, LOCAL_RECS } from '../data/mockData';
 
 const http = axios.create({ baseURL: import.meta.env.VITE_API_URL || '', timeout: 10_000 });
 
+http.interceptors.response.use(
+  (res) => res,
+  async (error) => {
+    const { config, response } = error;
+    if (response?.status === 429 && !config._retried) {
+      config._retried = true;
+      const delay = parseInt(response.headers['retry-after'] || '2', 10) * 1000;
+      await new Promise(r => setTimeout(r, delay));
+      return http(config);
+    }
+    const message = response?.data?.detail
+      || (response?.status === 503 ? 'Service temporarily unavailable' : '')
+      || error.message;
+    throw { status: response?.status, message, response };
+  }
+);
+
 export interface AuthUser {
   id: string;
   username: string;
@@ -65,8 +82,25 @@ export async function checkHealth(): Promise<{ ok: boolean; spotify: boolean }> 
   }
 }
 
-export async function registerAccount(username: string, password: string, displayName?: string): Promise<AuthResponse> {
-  const res = await http.post<AuthResponse>('/api/auth/register', { username, password, displayName });
+export interface RegisterResult {
+  requiresVerification?: boolean;
+  message?: string;
+  token?: string;
+  user?: AuthUser;
+}
+
+export async function registerAccount(username: string, password: string, displayName?: string): Promise<RegisterResult> {
+  const res = await http.post<RegisterResult>('/api/auth/register', { username, password, displayName });
+  return res.data;
+}
+
+export async function verifyEmail(token: string): Promise<AuthResponse> {
+  const res = await http.get<AuthResponse>('/api/auth/verify', { params: { token } });
+  return res.data;
+}
+
+export async function resendVerification(username: string): Promise<{ message: string }> {
+  const res = await http.post<{ message: string }>('/api/auth/resend-verification', { username });
   return res.data;
 }
 

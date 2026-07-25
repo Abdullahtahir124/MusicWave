@@ -70,9 +70,9 @@ def _loads(raw: Optional[str], default: Any = None) -> Any:
 
 def init_database() -> None:
     db = _get_db()
-    # Create indexes
     try:
         db["users"].create_index("username", unique=True)
+        db["users"].create_index("verification_token", sparse=True)
         db["tokens"].create_index("token", unique=True)
         db["tokens"].create_index("expires_at")
         db["recent_plays"].create_index([("user_id", ASCENDING), ("played_at", DESCENDING)])
@@ -94,7 +94,7 @@ def _doc_to_user(doc: dict) -> dict[str, Any]:
     }
 
 
-def create_user(username: str, password: str, display_name: Optional[str] = None) -> dict[str, Any]:
+def create_user(username: str, password: str, display_name: Optional[str] = None, *, skip_verification: bool = False) -> dict[str, Any]:
     clean_username = username.strip().lower()
     if not clean_username:
         raise ValueError("Username is required")
@@ -107,39 +107,57 @@ def create_user(username: str, password: str, display_name: Optional[str] = None
     created_at = _utc_now()
     display = (display_name or clean_username.split("@")[0] or "Listener").strip() or "Listener"
 
+    verification_token = secrets.token_urlsafe(32)
+    verification_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    verified = skip_verification
+
     try:
         db = _get_db()
         db.client.admin.command('ping')
-        db["users"].insert_one({
+        doc = {
             "_id": user_id,
             "id": user_id,
             "username": clean_username,
             "display_name": display,
             "password_hash": password_hash,
             "password_salt": salt,
+            "verified": verified,
             "created_at": created_at,
-        })
+        }
+        if not verified:
+            doc["verification_token"] = verification_token
+            doc["verification_expires"] = verification_expires
+        db["users"].insert_one(doc)
     except Exception as exc:
         print(f"[db] MongoDB registration failed: {exc} — using local fallback")
         local_db = _load_local_db()
         if clean_username in local_db["users"]:
             raise ValueError("Username already exists") from exc
-        local_db["users"][clean_username] = {
+        local_entry = {
             "id": user_id,
             "username": clean_username,
             "display_name": display,
             "password_hash": password_hash,
             "password_salt": salt,
+            "verified": verified,
             "created_at": created_at,
         }
+        if not verified:
+            local_entry["verification_token"] = verification_token
+            local_entry["verification_expires"] = verification_expires
+        local_db["users"][clean_username] = local_entry
         _save_local_db(local_db)
 
-    return {
+    result = {
         "id": user_id,
         "username": clean_username,
         "displayName": display,
         "createdAt": created_at,
+        "verified": verified,
     }
+    if not verified:
+        result["verification_token"] = verification_token
+    return result
 
 
 def authenticate_user(username: str, password: str) -> Optional[dict[str, Any]]:
@@ -153,7 +171,11 @@ def authenticate_user(username: str, password: str) -> Optional[dict[str, Any]]:
         expected = _hash_password(password, doc["password_salt"])
         if not secrets.compare_digest(expected, doc["password_hash"]):
             return None
+        if not doc.get("verified", True):
+            raise ValueError("Please verify your email before logging in")
         return _doc_to_user(doc)
+    except ValueError:
+        raise
     except Exception as exc:
         print(f"[db] MongoDB login failed: {exc} — using local fallback")
         local_db = _load_local_db()
@@ -163,12 +185,90 @@ def authenticate_user(username: str, password: str) -> Optional[dict[str, Any]]:
         expected = _hash_password(password, user_data["password_salt"])
         if not secrets.compare_digest(expected, user_data["password_hash"]):
             return None
+        if not user_data.get("verified", True):
+            raise ValueError("Please verify your email before logging in")
         return {
             "id": user_data["id"],
             "username": user_data["username"],
             "displayName": user_data["display_name"],
             "createdAt": user_data["created_at"],
         }
+
+
+def verify_user_email(token: str) -> Optional[dict[str, Any]]:
+    try:
+        db = _get_db()
+        db.client.admin.command('ping')
+        doc = db["users"].find_one({"verification_token": token})
+        if not doc:
+            return None
+        if doc.get("verified"):
+            return _doc_to_user(doc)
+
+        expires = datetime.fromisoformat(doc["verification_expires"])
+        if datetime.now(timezone.utc) > expires:
+            raise ValueError("Verification link has expired")
+
+        db["users"].update_one(
+            {"_id": doc["_id"]},
+            {"$set": {"verified": True}, "$unset": {"verification_token": "", "verification_expires": ""}},
+        )
+        return _doc_to_user(doc)
+    except ValueError:
+        raise
+    except Exception as exc:
+        print(f"[db] MongoDB verify failed: {exc} — using local fallback")
+        local_db = _load_local_db()
+        for uname, user_data in local_db["users"].items():
+            if user_data.get("verification_token") == token:
+                if user_data.get("verified"):
+                    return {
+                        "id": user_data["id"],
+                        "username": user_data["username"],
+                        "displayName": user_data["display_name"],
+                        "createdAt": user_data["created_at"],
+                    }
+                expires = datetime.fromisoformat(user_data["verification_expires"])
+                if datetime.now(timezone.utc) > expires:
+                    raise ValueError("Verification link has expired")
+                user_data["verified"] = True
+                user_data.pop("verification_token", None)
+                user_data.pop("verification_expires", None)
+                _save_local_db(local_db)
+                return {
+                    "id": user_data["id"],
+                    "username": user_data["username"],
+                    "displayName": user_data["display_name"],
+                    "createdAt": user_data["created_at"],
+                }
+        return None
+
+
+def resend_verification(username: str) -> Optional[str]:
+    clean_username = username.strip().lower()
+    new_token = secrets.token_urlsafe(32)
+    new_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    try:
+        db = _get_db()
+        db.client.admin.command('ping')
+        doc = db["users"].find_one({"username": clean_username})
+        if not doc or doc.get("verified"):
+            return None
+        db["users"].update_one(
+            {"_id": doc["_id"]},
+            {"$set": {"verification_token": new_token, "verification_expires": new_expires}},
+        )
+        return new_token
+    except Exception as exc:
+        print(f"[db] MongoDB resend failed: {exc} — using local fallback")
+        local_db = _load_local_db()
+        user_data = local_db["users"].get(clean_username)
+        if not user_data or user_data.get("verified"):
+            return None
+        user_data["verification_token"] = new_token
+        user_data["verification_expires"] = new_expires
+        _save_local_db(local_db)
+        return new_token
 
 
 def get_user(user_id: str) -> Optional[dict[str, Any]]:

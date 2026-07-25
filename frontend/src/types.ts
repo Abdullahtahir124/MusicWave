@@ -22,6 +22,7 @@ export interface Song {
   audioUrl: string | null;
   duration: number;          // ms
   previewAvailable: boolean;
+  playbackStatus?: 'available' | 'preview' | 'unavailable';
   matchScore?: number;
   features?: AudioFeatures;
 }

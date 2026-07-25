@@ -6,17 +6,6 @@ import type { Song } from '../context/AudioContext';
 
 const ACCENT = '#1DB954';
 
-const AUDIO_POOL = [
-  'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3',
-  'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3',
-  'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3',
-  'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-4.mp3',
-  'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-5.mp3',
-  'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-6.mp3',
-  'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-7.mp3',
-  'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-8.mp3',
-];
-
 const COVER_POOL = [
   'https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=300',
   'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?w=300',
@@ -29,14 +18,14 @@ const COVER_POOL = [
 ];
 
 const FALLBACK_SONGS: Song[] = [
-  { id: 'tr1', title: 'Blinding Lights', artist: 'The Weeknd', album: 'After Hours', genre: 'Pop', coverUrl: COVER_POOL[0], audioUrl: AUDIO_POOL[0], duration: 200000 },
-  { id: 'tr2', title: 'Levitating', artist: 'Dua Lipa', album: 'Future Nostalgia', genre: 'Pop', coverUrl: COVER_POOL[1], audioUrl: AUDIO_POOL[1], duration: 203000 },
-  { id: 'tr3', title: 'Peaches', artist: 'Justin Bieber', album: 'Justice', genre: 'R&B', coverUrl: COVER_POOL[2], audioUrl: AUDIO_POOL[2], duration: 198000 },
-  { id: 'tr4', title: 'Stay', artist: 'The Kid LAROI, Justin Bieber', album: 'Stay', genre: 'Pop', coverUrl: COVER_POOL[3], audioUrl: AUDIO_POOL[3], duration: 141000 },
-  { id: 'tr5', title: 'Industry Baby', artist: 'Lil Nas X', album: 'Montero', genre: 'Hip-Hop', coverUrl: COVER_POOL[4], audioUrl: AUDIO_POOL[4], duration: 212000 },
-  { id: 'tr6', title: 'Bad Habits', artist: 'Ed Sheeran', album: '=', genre: 'Pop', coverUrl: COVER_POOL[5], audioUrl: AUDIO_POOL[5], duration: 231000 },
-  { id: 'tr7', title: 'Kiss Me More', artist: 'Doja Cat, SZA', album: 'Planet Her', genre: 'Pop', coverUrl: COVER_POOL[6], audioUrl: AUDIO_POOL[6], duration: 215000 },
-  { id: 'tr8', title: 'Save Your Tears', artist: 'The Weeknd', album: 'After Hours', genre: 'Pop', coverUrl: COVER_POOL[7], audioUrl: AUDIO_POOL[7], duration: 215000 },
+  { id: 'tr1', title: 'Blinding Lights', artist: 'The Weeknd', album: 'After Hours', genre: 'Pop', coverUrl: COVER_POOL[0], audioUrl: null, duration: 200000 },
+  { id: 'tr2', title: 'Levitating', artist: 'Dua Lipa', album: 'Future Nostalgia', genre: 'Pop', coverUrl: COVER_POOL[1], audioUrl: null, duration: 203000 },
+  { id: 'tr3', title: 'Peaches', artist: 'Justin Bieber', album: 'Justice', genre: 'R&B', coverUrl: COVER_POOL[2], audioUrl: null, duration: 198000 },
+  { id: 'tr4', title: 'Stay', artist: 'The Kid LAROI, Justin Bieber', album: 'Stay', genre: 'Pop', coverUrl: COVER_POOL[3], audioUrl: null, duration: 141000 },
+  { id: 'tr5', title: 'Industry Baby', artist: 'Lil Nas X', album: 'Montero', genre: 'Hip-Hop', coverUrl: COVER_POOL[4], audioUrl: null, duration: 212000 },
+  { id: 'tr6', title: 'Bad Habits', artist: 'Ed Sheeran', album: '=', genre: 'Pop', coverUrl: COVER_POOL[5], audioUrl: null, duration: 231000 },
+  { id: 'tr7', title: 'Kiss Me More', artist: 'Doja Cat, SZA', album: 'Planet Her', genre: 'Pop', coverUrl: COVER_POOL[6], audioUrl: null, duration: 215000 },
+  { id: 'tr8', title: 'Save Your Tears', artist: 'The Weeknd', album: 'After Hours', genre: 'Pop', coverUrl: COVER_POOL[7], audioUrl: null, duration: 215000 },
 ];
 
 const PLAY_COUNTS = [23849120, 19204030, 18570440, 17384920, 15922800, 14330100, 13877650, 12543900];
@@ -73,7 +62,6 @@ export function TrendingPage() {
         if (data?.results?.length) {
           setSongs(data.results.map((s, i) => ({
             ...s,
-            audioUrl: s.audioUrl || AUDIO_POOL[i % AUDIO_POOL.length],
             coverUrl: s.coverUrl || COVER_POOL[i % COVER_POOL.length],
           })));
         }
@@ -116,7 +104,7 @@ export function TrendingPage() {
       <div className="grid gap-6 lg:grid-cols-3">
         {/* Chart list — takes 2 cols */}
         <div className="lg:col-span-2 space-y-2">
-          <h2 className="text-lg font-bold text-white mb-3">Top 20 Chart</h2>
+          <h2 className="text-lg font-bold text-white mb-3" aria-live="polite">Top {Math.min(songs.length, 20)} Chart</h2>
           {songs.slice(0, 20).map((song, i) => {
             const rank = i + 1;
             const trend = TRENDS[i % TRENDS.length];
@@ -127,7 +115,7 @@ export function TrendingPage() {
             return (
               <motion.div
                 key={song.id}
-                className="flex items-center gap-3 rounded-xl px-4 py-3 transition-all duration-200"
+                className="song-card flex items-center gap-3 rounded-xl px-4 py-3"
                 style={{
                   background: active ? 'rgba(29,185,84,0.08)' : 'rgba(40,40,40,0.5)',
                   border: `1px solid ${active ? 'rgba(29,185,84,0.3)' : 'rgba(255,255,255,0.05)'}`,
@@ -136,6 +124,15 @@ export function TrendingPage() {
                 animate={{ opacity: 1, x: 0 }}
                 transition={{ delay: i * 0.04 }}
                 whileHover={{ scale: 1.005 }}
+                tabIndex={0}
+                role="button"
+                aria-label={`${active && isPlaying ? 'Pause' : 'Play'} ${song.title} by ${song.artist}, rank ${rank}`}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    active ? togglePlay() : playSong(song, songs);
+                  }
+                }}
               >
                 {/* Rank */}
                 <div className="w-8 text-center flex-shrink-0">
@@ -173,7 +170,7 @@ export function TrendingPage() {
 
                 <button
                   onClick={() => active ? togglePlay() : playSong(song, songs)}
-                  className="flex h-8 w-8 items-center justify-center rounded-full text-black transition hover:scale-110"
+                  className="play-btn flex h-8 w-8 items-center justify-center rounded-full text-black"
                   style={{ background: ACCENT }}
                 >
                   {active && isPlaying ? <Pause size={13} fill="currentColor" /> : <Play size={13} fill="currentColor" />}

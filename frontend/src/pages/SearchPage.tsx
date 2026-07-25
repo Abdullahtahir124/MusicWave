@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Search, X, Play, Pause, Heart, Radio } from 'lucide-react';
 import { useAudio } from '../context/AudioContext';
 import type { Song } from '../context/AudioContext';
+import { useAnimationConfig } from '../hooks/useAnimationConfig';
 
 const ACCENT = '#1DB954';
 
@@ -24,14 +25,6 @@ const COVER_POOL = [
   'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=300',
   'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=300',
   'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=300',
-];
-
-const AUDIO_POOL = [
-  'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3',
-  'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3',
-  'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3',
-  'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-4.mp3',
-  'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-5.mp3',
 ];
 
 function fmt(ms: number) {
@@ -91,8 +84,43 @@ function PreviewPlayer({ previewUrl }: { previewUrl: string }) {
   );
 }
 
+function StatusBadge({ status }: { status?: string }) {
+  const config: Record<string, { label: string; color: string; bg: string }> = {
+    available: { label: 'Available', color: '#1DB954', bg: 'rgba(29,185,84,0.12)' },
+    preview: { label: 'Sample Audio', color: '#D29922', bg: 'rgba(210,153,34,0.12)' },
+    unavailable: { label: 'Not Available', color: '#F85149', bg: 'rgba(248,81,73,0.12)' },
+  };
+  const c = config[status || ''] ?? { label: 'Unknown', color: '#8b949e', bg: 'rgba(139,148,158,0.12)' };
+
+  return (
+    <span
+      className="hidden items-center gap-1.5 rounded px-2 py-0.5 text-[10px] font-semibold sm:inline-flex"
+      style={{ color: c.color, background: c.bg }}
+      aria-label={`Track ${c.label.toLowerCase()}`}
+    >
+      <span style={{ width: 6, height: 6, borderRadius: '50%', background: c.color, flexShrink: 0 }} />
+      {c.label}
+    </span>
+  );
+}
+
+function SkeletonRow() {
+  return (
+    <div className="flex items-center gap-3 rounded-xl px-4 py-3" style={{ background: 'rgba(255,255,255,0.02)' }}>
+      <div className="skeleton h-12 w-12 flex-shrink-0 rounded-lg" />
+      <div className="flex-1 space-y-2">
+        <div className="skeleton h-3.5 w-40 rounded" />
+        <div className="skeleton h-2.5 w-28 rounded" />
+      </div>
+      <div className="skeleton hidden h-3 w-10 rounded sm:block" />
+      <div className="skeleton h-9 w-9 rounded-full" />
+    </div>
+  );
+}
+
 export function SearchPage() {
   const { playSong, currentSong, isPlaying, togglePlay, toggleLike, likedSongs } = useAudio();
+  const anim = useAnimationConfig();
   const [query, setQuery] = useState('');
   const [genre, setGenre] = useState('All');
   const [results, setResults] = useState<Song[]>([]);
@@ -118,24 +146,20 @@ export function SearchPage() {
       setLoading(true);
       setError('');
       try {
-        let url = '';
-        if (activeQuery) {
-          url = `${API_BASE}/api/search/advanced?q=${encodeURIComponent(activeQuery)}`;
-        } else {
-          url = `${API_BASE}/api/search/advanced?genre=${encodeURIComponent(genre)}`;
-        }
+        // /api/search/advanced supports q, genre, artist params
+        const params = new URLSearchParams();
+        if (activeQuery) params.set('q', activeQuery);
+        if (genre !== 'All') params.set('genre', genre);
+
+        const url = `${API_BASE}/api/search/advanced?${params.toString()}`;
         const res = await fetch(url);
         if (!res.ok) throw new Error('Search failed');
         const data = await res.json() as { results: Song[] };
-        let filtered = (data.results ?? []).map((s, i) => ({
+        const filled = (data.results ?? []).map((s, i) => ({
           ...s,
-          audioUrl: s.audioUrl || AUDIO_POOL[i % AUDIO_POOL.length],
           coverUrl: s.coverUrl || COVER_POOL[i % COVER_POOL.length],
         }));
-        if (activeQuery && genre !== 'All') {
-          filtered = filtered.filter(s => s.genre?.toLowerCase().includes(genre.toLowerCase()));
-        }
-        setResults(filtered);
+        setResults(filled);
       } catch {
         setError('Something went wrong. Please try again.');
         setResults([]);
@@ -245,9 +269,11 @@ export function SearchPage() {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
+            role="region"
+            aria-label="Search results"
           >
             <div className="mb-4 flex items-center justify-between">
-              <h2 className="text-lg font-bold text-white">
+              <h2 className="text-lg font-bold text-white" aria-live="polite" aria-atomic="true">
                 {loading ? 'Searching…' : results.length > 0 ? `${results.length} results` : 'No results'}
               </h2>
               {!loading && results.length > 0 && (
@@ -263,32 +289,45 @@ export function SearchPage() {
               </div>
             )}
 
-            {/* Loading */}
+            {/* Loading skeletons */}
             {loading && (
-              <div className="flex items-center justify-center py-16">
-                <div className="h-8 w-8 animate-spin rounded-full border-2 border-t-transparent"
-                  style={{ borderColor: ACCENT, borderTopColor: 'transparent' }} />
+              <div className="space-y-2">
+                {Array.from({ length: 6 }).map((_, i) => (
+                  <SkeletonRow key={i} />
+                ))}
               </div>
             )}
 
             {/* Results grid */}
             {!loading && results.length > 0 && (
-              <div className="space-y-2">
+              <div className="space-y-2" role="list" aria-label="Search results list">
                 {results.map((song, i) => {
                   const active = currentSong?.id === song.id;
                   const liked = likedSongs.some(s => s.id === song.id);
                   return (
                     <motion.div
                       key={song.id}
-                      className="flex items-center gap-3 rounded-xl px-4 py-3 transition-all duration-200"
+                      className="song-card flex items-center gap-3 rounded-xl px-4 py-3"
                       style={{
                         background: active ? 'rgba(29,185,84,0.08)' : 'rgba(255,255,255,0.03)',
                         border: `1px solid ${active ? 'rgba(29,185,84,0.25)' : 'rgba(255,255,255,0.06)'}`,
                       }}
                       initial={{ opacity: 0, x: -8 }}
                       animate={{ opacity: 1, x: 0 }}
-                      transition={{ delay: i * 0.03 }}
-                      whileHover={{ backgroundColor: active ? 'rgba(29,185,84,0.1)' : 'rgba(255,255,255,0.05)' }}
+                      transition={{ delay: i * 0.03, ...anim.cardInteraction.transition }}
+                      whileHover={{ ...anim.cardInteraction.whileHover, backgroundColor: active ? 'rgba(29,185,84,0.1)' : 'rgba(255,255,255,0.05)' }}
+                      whileTap={anim.cardInteraction.whileTap}
+                      tabIndex={0}
+                      role="button"
+                      aria-label={`${song.playbackStatus === 'unavailable' ? 'Unavailable:' : active && isPlaying ? 'Pause' : 'Play'} ${song.title} by ${song.artist}`}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          if (song.playbackStatus !== 'unavailable') {
+                            active ? togglePlay() : playSong(song, results);
+                          }
+                        }
+                      }}
                     >
                       <div className="relative h-12 w-12 flex-shrink-0 overflow-hidden rounded-lg">
                         <img src={song.coverUrl} alt="" className="h-full w-full object-cover" />
@@ -306,14 +345,17 @@ export function SearchPage() {
                       </div>
 
                       <div className="flex-1 min-w-0" onClick={() => active ? togglePlay() : playSong(song, results)} style={{ cursor: 'pointer' }}>
-                        <p className="truncate text-sm font-semibold" style={{ color: active ? ACCENT : '#fff' }}>{song.title}</p>
+                        <div className="flex items-center gap-2">
+                          <p className="truncate text-sm font-semibold" style={{ color: active ? ACCENT : '#fff' }}>{song.title}</p>
+                          <StatusBadge status={song.playbackStatus} />
+                        </div>
                         <p className="truncate text-xs text-white/50">{song.artist} {song.album ? `• ${song.album}` : ''}</p>
                       </div>
 
                       <span className="hidden text-xs text-white/35 sm:block">{fmt(song.duration)}</span>
 
-                      {/* 30-sec preview button for Deezer tracks */}
-                      {song.previewAvailable && song.audioUrl && song.id.startsWith('dz-') && (
+                      {/* 30-sec preview button — shown for any track that has an audio URL */}
+                      {song.audioUrl && song.previewAvailable && (
                         <PreviewPlayer previewUrl={song.audioUrl} />
                       )}
 
@@ -323,16 +365,23 @@ export function SearchPage() {
                         <Heart size={16} fill={liked ? 'currentColor' : 'none'} />
                       </button>
 
-                      <button
-                        onClick={() => active ? togglePlay() : playSong(song, results)}
-                        className="flex h-9 w-9 items-center justify-center rounded-full text-black transition hover:scale-105"
-                        style={{ background: ACCENT }}
-                        aria-label={active && isPlaying ? 'Pause' : 'Play'}
+                      <motion.button
+                        onClick={() => song.playbackStatus !== 'unavailable' && (active ? togglePlay() : playSong(song, results))}
+                        className="play-btn flex h-9 w-9 items-center justify-center rounded-full text-black"
+                        style={{
+                          background: song.playbackStatus === 'unavailable' ? 'rgba(255,255,255,0.1)' : ACCENT,
+                          cursor: song.playbackStatus === 'unavailable' ? 'not-allowed' : 'pointer',
+                          opacity: song.playbackStatus === 'unavailable' ? 0.5 : 1,
+                        }}
+                        aria-label={song.playbackStatus === 'unavailable' ? 'Track not available' : active && isPlaying ? 'Pause' : 'Play'}
+                        disabled={song.playbackStatus === 'unavailable'}
+                        whileHover={song.playbackStatus !== 'unavailable' ? anim.buttonPress.whileHover : undefined}
+                        whileTap={song.playbackStatus !== 'unavailable' ? anim.buttonPress.whileTap : undefined}
                       >
                         {active && isPlaying
                           ? <Pause size={14} fill="currentColor" />
                           : <Play size={14} fill="currentColor" />}
-                      </button>
+                      </motion.button>
                     </motion.div>
                   );
                 })}
