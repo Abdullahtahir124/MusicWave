@@ -7,6 +7,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
+import certifi
 from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.collection import Collection
@@ -37,7 +38,11 @@ def _save_local_db(db_data: dict) -> None:
 def _get_db():
     global _client
     if _client is None:
-        _client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=1500)
+        kwargs: dict[str, Any] = {"serverSelectionTimeoutMS": 8000, "connectTimeoutMS": 8000}
+        if MONGODB_URI.startswith("mongodb+srv://") or "ssl=true" in MONGODB_URI or "tls=true" in MONGODB_URI:
+            kwargs["tls"] = True
+            kwargs["tlsCAFile"] = certifi.where()
+        _client = MongoClient(MONGODB_URI, **kwargs)
     return _client["musicwave"]
 
 
