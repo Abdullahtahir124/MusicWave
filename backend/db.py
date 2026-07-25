@@ -17,7 +17,12 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 _client: MongoClient | None = None
 
-LOCAL_DB_PATH = os.path.join(os.path.dirname(__file__), "local_db.json")
+_IS_SERVERLESS = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
+LOCAL_DB_PATH = (
+    "/tmp/musicwave_local_db.json"
+    if _IS_SERVERLESS
+    else os.path.join(os.path.dirname(__file__), "local_db.json")
+)
 
 def _load_local_db() -> dict:
     if not os.path.exists(LOCAL_DB_PATH):
@@ -139,6 +144,10 @@ def create_user(username: str, password: str, display_name: Optional[str] = None
         db["users"].insert_one(doc)
     except Exception as exc:
         print(f"[db] MongoDB registration failed: {exc} — using local fallback")
+        if _IS_SERVERLESS:
+            raise RuntimeError(
+                f"Database unavailable. Please try again in a moment. (details: {exc})"
+            ) from exc
         local_db = _load_local_db()
         if clean_username in local_db["users"]:
             raise ValueError("Username already exists") from exc
