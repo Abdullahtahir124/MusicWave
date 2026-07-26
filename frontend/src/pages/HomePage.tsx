@@ -98,20 +98,22 @@ function SongRow({ song, queue, index }: { song: Song; queue: Song[]; index: num
   );
 }
 
-const MOOD_GENRES: Record<string, string[]> = {
-  Happy: ['pop', 'dance', 'happy', 'k-pop'],
-  Chill: ['r&b', 'acoustic', 'chill', 'soft', 'indie'],
-  Energetic: ['rock', 'electronic', 'dance', 'hip-hop', 'edm', 'latin'],
-  Sad: ['indie', 'acoustic', 'pop', 'sad', 'blues'],
-  Focus: ['classical', 'instrumental', 'lofi', 'electronic', 'ambient'],
-  Party: ['pop', 'hip-hop', 'electronic', 'dance', 'edm', 'latin', 'party'],
+const MOOD_QUERIES: Record<string, string> = {
+  Happy: 'feel good hits',
+  Chill: 'chill vibes indie',
+  Energetic: 'workout motivation hits',
+  Sad: 'sad emotional ballads',
+  Focus: 'lofi study beats',
+  Party: 'edm dance bangers',
 };
 
 export function HomePage({ user }: { user?: string }) {
   const { playSong, currentSong, isPlaying, togglePlay, recentPlays } = useAudio();
   const [featured, setFeatured] = useState<Song[]>(FALLBACK_SONGS);
+  const [moodTracks, setMoodTracks] = useState<Song[]>([]);
   const [selectedMood, setSelectedMood] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [moodLoading, setMoodLoading] = useState(false);
 
   useEffect(() => {
     fetch('/api/featured')
@@ -128,13 +130,28 @@ export function HomePage({ user }: { user?: string }) {
       .finally(() => setLoading(false));
   }, []);
 
-  const filteredFeatured = selectedMood
-    ? featured.filter(song => {
-        const genres = MOOD_GENRES[selectedMood];
-        const songGenre = (song.genre || '').toLowerCase();
-        return genres.some(g => songGenre.includes(g));
+  useEffect(() => {
+    if (!selectedMood) {
+      setMoodTracks([]);
+      return;
+    }
+    const query = MOOD_QUERIES[selectedMood];
+    if (!query) return;
+    setMoodLoading(true);
+    fetch(`/api/search?q=${encodeURIComponent(query)}`)
+      .then(r => r.ok ? r.json() : null)
+      .then((data: { results?: Song[] } | null) => {
+        const results = (data?.results ?? []).slice(0, 20).map((s, i) => ({
+          ...s,
+          coverUrl: s.coverUrl || COVER_POOL[i % COVER_POOL.length],
+        }));
+        setMoodTracks(results);
       })
-    : featured;
+      .catch(() => setMoodTracks([]))
+      .finally(() => setMoodLoading(false));
+  }, [selectedMood]);
+
+  const filteredFeatured = selectedMood ? moodTracks : featured;
 
   const heroSong = currentSong || filteredFeatured[0] || featured[0];
   const greet = () => {
@@ -246,7 +263,7 @@ export function HomePage({ user }: { user?: string }) {
       {/* Featured tracks */}
       <section>
         <div className="flex items-center justify-between mb-3">
-          <h2 className="text-lg font-bold text-white" aria-live="polite">{loading ? 'Loading…' : `Featured Tracks${selectedMood ? ` (${selectedMood})` : ''}`}</h2>
+          <h2 className="text-lg font-bold text-white" aria-live="polite">{loading || moodLoading ? 'Loading…' : `Featured Tracks${selectedMood ? ` (${selectedMood})` : ''}`}</h2>
           {selectedMood && (
             <button
               onClick={() => setSelectedMood(null)}
@@ -256,7 +273,7 @@ export function HomePage({ user }: { user?: string }) {
             </button>
           )}
         </div>
-        {loading ? (
+        {loading || moodLoading ? (
           <div className="grid gap-2 sm:grid-cols-2">
             {[...Array(6)].map((_, i) => (
               <div key={i} className="skeleton h-16 rounded-xl" />
@@ -270,7 +287,7 @@ export function HomePage({ user }: { user?: string }) {
               ))
             ) : (
               <div className="col-span-2 py-8 text-center text-sm text-white/45">
-                No songs matching the mood "{selectedMood}" found in featured tracks.
+                {selectedMood ? `No ${selectedMood.toLowerCase()} tracks found. Try another mood.` : 'No tracks found.'}
               </div>
             )}
           </div>

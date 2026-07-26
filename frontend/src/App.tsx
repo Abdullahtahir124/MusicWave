@@ -141,9 +141,6 @@ function Dashboard({ user, email, onLogout }: { user: string; email: string; onL
             />
           </div>
           <p className="mt-2.5 max-w-[160px] truncate text-sm font-bold text-white">{user}</p>
-          <p className="mt-0.5 text-[10px] font-semibold" style={{ color: ACCENT }}>
-            Premium Member
-          </p>
         </div>
 
         {/* Nav items */}
