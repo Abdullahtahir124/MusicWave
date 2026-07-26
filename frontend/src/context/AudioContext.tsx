@@ -111,10 +111,9 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
   const playRequestIdRef = useRef<number>(0);
 
   useEffect(() => {
-    // Create HTML Audio element
+    // Create HTML Audio element (no crossOrigin — allows Deezer CDN previews to play
+    // without requiring CORS headers on their response)
     const audio = new Audio();
-    // Bypassing Web Audio Context source node connection to ensure cross-origin (CORS) streams play correctly.
-    audio.crossOrigin = 'anonymous';
     audio.volume = volume;
     audio.playbackRate = playbackRate;
     audioRef.current = audio;
@@ -194,6 +193,17 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
     };
   }, []);
 
+  const resolveAudioUrl = (song: Song): string | null => {
+    // For Deezer songs (id starts with "dz-"), always use our backend endpoint that
+    // fetches a fresh, unexpired preview URL. This eliminates cache-stale errors
+    // like ERR_CONNECTION_TIMED_OUT or NotSupportedError from expired signed URLs.
+    if (song.id?.startsWith('dz-')) {
+      const trackId = song.id.slice(3);
+      return `${API_BASE}/api/track-audio/${encodeURIComponent(trackId)}`;
+    }
+    return song.audioUrl;
+  };
+
   const playSong = (song: Song, queue: Song[] = []) => {
     if (song.playbackStatus === 'unavailable' && !song.audioUrl) {
       try { addToast('This track is not available for playback', 'error'); } catch { }
@@ -252,7 +262,8 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
     const reqId = playRequestIdRef.current;
 
     if (audioRef.current) {
-      if (!song.audioUrl) {
+      const resolvedUrl = resolveAudioUrl(song);
+      if (!resolvedUrl) {
         audioRef.current.pause();
         audioRef.current.removeAttribute('src');
         setIsPlaying(false);
@@ -263,9 +274,8 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
       }
 
       const existingSrc = audioRef.current.src || '';
-      if (existingSrc === song.audioUrl) {
+      if (existingSrc === resolvedUrl) {
         try { console.log('playSong: same src, calling play only'); } catch { }
-        // only call play if this request is still the latest
         if (playRequestIdRef.current !== reqId) {
           try { console.log('playSong: aborting because a newer request exists'); } catch { }
           return;
@@ -275,7 +285,6 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
           playPromise
             .then(() => setIsPlaying(true))
             .catch(err => {
-              // eslint-disable-next-line no-console
               console.error('Playback failed:', err, 'src=', audioRef.current?.src);
               try {
                 if (loadingToastRef.current) { removeToast(loadingToastRef.current); loadingToastRef.current = null; }
@@ -287,13 +296,12 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
         return;
       }
 
-      audioRef.current.src = song.audioUrl;
+      audioRef.current.src = resolvedUrl;
       audioRef.current.volume = volume;
       audioRef.current.autoplay = true;
       audioRef.current.playbackRate = playbackRate;
 
       try {
-        // eslint-disable-next-line no-console
         console.log('Attempting playback immediately', { src: audioRef.current.src, readyState: audioRef.current.readyState });
       } catch { }
 
@@ -313,7 +321,6 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
               addToast(`Now playing: ${song.title}${tierLabel}`, 'success');
             } catch { }
           }).catch(err => {
-            // eslint-disable-next-line no-console
             console.error('Playback failed on initial play:', err, 'src=', audioRef.current?.src);
             try {
               if (loadingToastRef.current) {
@@ -327,14 +334,20 @@ export const AudioProvider = ({ children }: { children: React.ReactNode }) => {
         }
       };
 
+      // Fallback: if direct URL fails (e.g. non-Deezer song with raw URL), try the generic proxy.
+      // Deezer songs already go through /api/track-audio which always returns fresh audio, so
+      // this fallback is only relevant for other sources.
       let proxied = false;
       const handleNetworkError = () => {
         if (proxied) return;
         proxied = true;
-        try { console.warn('Audio element error detected, retrying via backend proxy'); } catch { }
         if (!audioRef.current) return;
         audioRef.current.removeEventListener('error', handleNetworkError);
-        audioRef.current.src = `${API_BASE}/api/proxy?url=${encodeURIComponent(song.audioUrl || '')}`;
+        if (song.id?.startsWith('dz-')) {
+          // Already using track-audio endpoint — no further retry available.
+          return;
+        }
+        audioRef.current.src = `${API_BASE}/api/proxy?url=${encodeURIComponent(resolvedUrl)}`;
         playAttempt();
       };
 

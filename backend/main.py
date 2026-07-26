@@ -804,21 +804,77 @@ async def recommend_songs(songId: str, limit: int = 5):
     return RecommendationResponse(recommendations=recs)
 
 
+_BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer': 'https://www.deezer.com/',
+    'Origin': 'https://www.deezer.com',
+}
+
+
+@app.get('/api/track-audio/{track_id}')
+async def track_audio(track_id: str):
+    """Fetch a FRESH Deezer preview URL for the given track ID and stream the audio.
+
+    Deezer's preview URLs contain a short-lived signature. Fetching a new one on every
+    play request ensures the URL is never stale by the time the browser downloads it.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15, headers=_BROWSER_HEADERS) as client:
+            api_resp = await client.get(f'https://api.deezer.com/track/{track_id}')
+            if api_resp.status_code != 200:
+                return Response(content='Track not found', status_code=404)
+            preview_url = api_resp.json().get('preview')
+            if not preview_url:
+                return Response(content='No preview available for this track', status_code=404)
+
+            audio_resp = await client.get(preview_url, follow_redirects=True)
+
+        if audio_resp.status_code >= 400:
+            print(f"[track-audio] Deezer CDN returned {audio_resp.status_code} for track {track_id}")
+            return Response(content='Preview fetch failed', status_code=502)
+
+        return Response(
+            content=audio_resp.content,
+            media_type='audio/mpeg',
+            headers={
+                'Cache-Control': 'public, max-age=300',
+                'Access-Control-Allow-Origin': '*',
+                'Accept-Ranges': 'bytes',
+            },
+        )
+    except Exception as exc:
+        print(f"[track-audio] error for {track_id}: {exc}")
+        return Response(content=f'Fetch failed: {exc}', status_code=502)
+
+
 @app.get('/api/proxy')
 async def proxy(url: str = Query(...)):
-    """Simple proxy to fetch audio resources server-side to avoid CORS issues in the browser.
-    Usage: /api/proxy?url=<encoded-url>
-    """
+    """Generic HTTP proxy for arbitrary audio URLs (used as a fallback)."""
     if not url or not url.startswith('http'):
         return Response(content='Invalid url', status_code=400)
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.get(url, follow_redirects=True, timeout=20)
+        async with httpx.AsyncClient(timeout=25, headers=_BROWSER_HEADERS) as client:
+            resp = await client.get(url, follow_redirects=True)
     except Exception as exc:
+        print(f"[proxy] fetch failed for {url}: {exc}")
         return Response(content=f'Fetch failed: {exc}', status_code=502)
 
-    content_type = resp.headers.get('content-type', 'application/octet-stream')
-    return Response(content=resp.content, media_type=content_type)
+    if resp.status_code >= 400:
+        print(f"[proxy] upstream returned {resp.status_code} for {url}")
+        return Response(content=resp.content, status_code=resp.status_code)
+
+    content_type = resp.headers.get('content-type', 'audio/mpeg')
+    return Response(
+        content=resp.content,
+        media_type=content_type,
+        headers={
+            'Cache-Control': 'public, max-age=300',
+            'Access-Control-Allow-Origin': '*',
+        },
+    )
 
 
 class RegisterResponse(BaseModel):
