@@ -44,13 +44,16 @@ def _get_db():
     global _client
     if _client is None:
         kwargs: dict[str, Any] = {
-            "serverSelectionTimeoutMS": 5000,
-            "connectTimeoutMS": 5000,
-            "socketTimeoutMS": 5000,
+            "serverSelectionTimeoutMS": 10000,
+            "connectTimeoutMS": 10000,
+            "socketTimeoutMS": 10000,
+            "retryWrites": True,
+            "tlsDisableOCSPEndpointCheck": True,
         }
         if MONGODB_URI.startswith("mongodb+srv://") or "ssl=true" in MONGODB_URI or "tls=true" in MONGODB_URI:
             kwargs["tls"] = True
             kwargs["tlsCAFile"] = certifi.where()
+            kwargs["tlsAllowInvalidCertificates"] = True
         _client = MongoClient(MONGODB_URI, **kwargs)
     return _client["musicwave"]
 
