@@ -1,3 +1,13 @@
+"""
+User + playlist storage backed by Upstash Redis (Vercel KV).
+
+Uses HTTPS-based REST API — no TLS driver issues on serverless runtimes.
+Falls back to an in-process dict if no Redis env vars are configured (local dev).
+
+Function signatures are kept identical to the previous MongoDB-based implementation
+so backend/main.py does not need any changes.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -7,79 +17,90 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
-import certifi
 from dotenv import load_dotenv
-from pymongo import MongoClient, ASCENDING, DESCENDING
-from pymongo.collection import Collection
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
-_client: MongoClient | None = None
+# ── Redis client (Upstash / Vercel KV) ────────────────────────────────────────
+# Vercel KV injects KV_REST_API_URL / KV_REST_API_TOKEN.
+# Upstash direct: UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN.
+_REDIS_URL = os.getenv("KV_REST_API_URL") or os.getenv("UPSTASH_REDIS_REST_URL")
+_REDIS_TOKEN = os.getenv("KV_REST_API_TOKEN") or os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
-_IS_SERVERLESS = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
-LOCAL_DB_PATH = (
-    "/tmp/musicwave_local_db.json"
-    if _IS_SERVERLESS
-    else os.path.join(os.path.dirname(__file__), "local_db.json")
-)
+_redis = None
+_local_store: dict[str, Any] = {}  # in-process fallback for local dev without Redis
 
-def _load_local_db() -> dict:
-    if not os.path.exists(LOCAL_DB_PATH):
-        return {"users": {}, "tokens": {}, "favorites": {}, "playlists": {}, "playlist_items": {}}
+if _REDIS_URL and _REDIS_TOKEN:
     try:
-        with open(LOCAL_DB_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"users": {}, "tokens": {}, "favorites": {}, "playlists": {}, "playlist_items": {}}
-
-def _save_local_db(db_data: dict) -> None:
-    try:
-        with open(LOCAL_DB_PATH, "w", encoding="utf-8") as f:
-            json.dump(db_data, f, ensure_ascii=False, indent=2)
-    except Exception as exc:
-        print(f"[db] Failed to save local DB: {exc}")
-
-def _get_db():
-    global _client
-    if _client is None:
-        kwargs: dict[str, Any] = {
-            "serverSelectionTimeoutMS": 10000,
-            "connectTimeoutMS": 10000,
-            "socketTimeoutMS": 10000,
-            "retryWrites": True,
-        }
-        if MONGODB_URI.startswith("mongodb+srv://") or "ssl=true" in MONGODB_URI or "tls=true" in MONGODB_URI:
-            kwargs["tls"] = True
-            kwargs["tlsCAFile"] = certifi.where()
-            kwargs["tlsAllowInvalidCertificates"] = True
-        try:
-            _client = MongoClient(MONGODB_URI, **kwargs)
-        except Exception as exc:
-            print(f"[db] MongoClient init failed: {exc}")
-            raise
-    return _client["musicwave"]
+        from upstash_redis import Redis
+        _redis = Redis(url=_REDIS_URL, token=_REDIS_TOKEN)
+    except Exception as exc:  # pragma: no cover
+        print(f"[db] Failed to init Upstash client: {exc}")
+        _redis = None
 
 
-def _utc_now() -> str:
+def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 def _hash_password(password: str, salt: str) -> str:
-    digest = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt.encode("utf-8"),
-        50_000,
-    )
-    return digest.hex()
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), 50_000
+    ).hex()
 
 
-def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False)
+# ── Low-level KV wrappers ─────────────────────────────────────────────────────
+# We expose get/set/delete/list-manipulation methods that work either against
+# real Upstash Redis or the local in-process dict fallback.
+
+def _kv_get(key: str) -> Optional[str]:
+    if _redis:
+        return _redis.get(key)
+    return _local_store.get(key)
 
 
-def _loads(raw: Optional[str], default: Any = None) -> Any:
+def _kv_set(key: str, value: str) -> None:
+    if _redis:
+        _redis.set(key, value)
+    else:
+        _local_store[key] = value
+
+
+def _kv_delete(*keys: str) -> None:
+    if not keys:
+        return
+    if _redis:
+        _redis.delete(*keys)
+    else:
+        for k in keys:
+            _local_store.pop(k, None)
+
+
+def _kv_set_add(key: str, *members: str) -> None:
+    if _redis:
+        _redis.sadd(key, *members)
+    else:
+        s: set[str] = set(_local_store.get(key, set()))
+        s.update(members)
+        _local_store[key] = s
+
+
+def _kv_set_remove(key: str, *members: str) -> None:
+    if _redis:
+        _redis.srem(key, *members)
+    else:
+        s: set[str] = set(_local_store.get(key, set()))
+        s.difference_update(members)
+        _local_store[key] = s
+
+
+def _kv_set_members(key: str) -> list[str]:
+    if _redis:
+        return list(_redis.smembers(key) or [])
+    return list(_local_store.get(key, set()))
+
+
+def _load_json(raw: Optional[str], default: Any = None) -> Any:
     if not raw:
         return default
     try:
@@ -88,97 +109,89 @@ def _loads(raw: Optional[str], default: Any = None) -> Any:
         return default
 
 
+def _dump_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+# ── init ──────────────────────────────────────────────────────────────────────
+
 def init_database() -> None:
-    db = _get_db()
+    """No-op — Redis needs no schema, but we ping to warm connection & surface errors early."""
+    if _redis is None:
+        print("[db] No Redis configured — using in-process fallback (data will be lost on restart)")
+        return
     try:
-        db["users"].create_index("username", unique=True)
-        db["users"].create_index("verification_token", sparse=True)
-        db["tokens"].create_index("token", unique=True)
-        db["tokens"].create_index("expires_at")
-        db["recent_plays"].create_index([("user_id", ASCENDING), ("played_at", DESCENDING)])
-        db["favorites"].create_index([("user_id", ASCENDING), ("song_id", ASCENDING)], unique=True)
-        db["playlists"].create_index([("user_id", ASCENDING), ("updated_at", DESCENDING)])
-        db["playlist_items"].create_index([("playlist_id", ASCENDING), ("position", ASCENDING)])
+        _redis.set("__init__", _now())
     except Exception as exc:
-        print(f"[db] Index creation warning: {exc}")
+        print(f"[db] Redis ping failed: {exc}")
 
 
-# ── User helpers ─────────────────────────────────────────────────────────────
+# ── User helpers ──────────────────────────────────────────────────────────────
 
-def _doc_to_user(doc: dict) -> dict[str, Any]:
+def _user_key(username: str) -> str:
+    return f"user:{username.strip().lower()}"
+
+
+def _user_id_key(user_id: str) -> str:
+    return f"user_id:{user_id}"
+
+
+def _verify_key(token: str) -> str:
+    return f"verify:{token}"
+
+
+def _user_from_record(rec: dict[str, Any]) -> dict[str, Any]:
     return {
-        "id": str(doc["_id"]) if "_id" in doc else doc.get("id", ""),
-        "username": doc["username"],
-        "displayName": doc.get("display_name", doc.get("displayName", "")),
-        "createdAt": doc.get("created_at", doc.get("createdAt", "")),
+        "id": rec["id"],
+        "username": rec["username"],
+        "displayName": rec.get("display_name", ""),
+        "createdAt": rec.get("created_at", ""),
     }
 
 
-def create_user(username: str, password: str, display_name: Optional[str] = None, *, skip_verification: bool = False) -> dict[str, Any]:
+def create_user(
+    username: str,
+    password: str,
+    display_name: Optional[str] = None,
+    *,
+    skip_verification: bool = False,
+) -> dict[str, Any]:
     clean_username = username.strip().lower()
     if not clean_username:
         raise ValueError("Username is required")
     if len(password) < 6:
         raise ValueError("Password must be at least 6 characters long")
 
-    salt = secrets.token_hex(16)
-    password_hash = _hash_password(password, salt)
-    user_id = secrets.token_hex(12)
-    created_at = _utc_now()
-    display = (display_name or clean_username.split("@")[0] or "Listener").strip() or "Listener"
+    if _kv_get(_user_key(clean_username)):
+        raise ValueError("Username already exists")
 
+    salt = secrets.token_hex(16)
+    user_id = secrets.token_hex(12)
+    display = (display_name or clean_username.split("@")[0] or "Listener").strip() or "Listener"
     verification_token = secrets.token_urlsafe(32)
     verification_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
     verified = skip_verification
 
-    try:
-        db = _get_db()
-        db.client.admin.command('ping')
-        doc = {
-            "_id": user_id,
-            "id": user_id,
-            "username": clean_username,
-            "display_name": display,
-            "password_hash": password_hash,
-            "password_salt": salt,
-            "verified": verified,
-            "created_at": created_at,
-        }
-        if not verified:
-            doc["verification_token"] = verification_token
-            doc["verification_expires"] = verification_expires
-        db["users"].insert_one(doc)
-    except Exception as exc:
-        print(f"[db] MongoDB registration failed: {exc} — using local fallback")
-        if _IS_SERVERLESS:
-            raise RuntimeError(
-                f"Database unavailable. Please try again in a moment. (details: {exc})"
-            ) from exc
-        local_db = _load_local_db()
-        if clean_username in local_db["users"]:
-            raise ValueError("Username already exists") from exc
-        local_entry = {
-            "id": user_id,
-            "username": clean_username,
-            "display_name": display,
-            "password_hash": password_hash,
-            "password_salt": salt,
-            "verified": verified,
-            "created_at": created_at,
-        }
-        if not verified:
-            local_entry["verification_token"] = verification_token
-            local_entry["verification_expires"] = verification_expires
-        local_db["users"][clean_username] = local_entry
-        _save_local_db(local_db)
-
-    result = {
+    record = {
         "id": user_id,
         "username": clean_username,
-        "displayName": display,
-        "createdAt": created_at,
+        "display_name": display,
+        "password_hash": _hash_password(password, salt),
+        "password_salt": salt,
         "verified": verified,
+        "created_at": _now(),
     }
+    if not verified:
+        record["verification_token"] = verification_token
+        record["verification_expires"] = verification_expires
+
+    _kv_set(_user_key(clean_username), _dump_json(record))
+    _kv_set(_user_id_key(user_id), clean_username)
+    if not verified:
+        _kv_set(_verify_key(verification_token), clean_username)
+
+    result = _user_from_record(record)
+    result["verified"] = verified
     if not verified:
         result["verification_token"] = verification_token
     return result
@@ -186,200 +199,93 @@ def create_user(username: str, password: str, display_name: Optional[str] = None
 
 def authenticate_user(username: str, password: str) -> Optional[dict[str, Any]]:
     clean_username = username.strip().lower()
-    try:
-        db = _get_db()
-        db.client.admin.command('ping')
-        doc = db["users"].find_one({"username": clean_username})
-        if doc is None:
-            return None
-        expected = _hash_password(password, doc["password_salt"])
-        if not secrets.compare_digest(expected, doc["password_hash"]):
-            return None
-        if not doc.get("verified", True):
-            raise ValueError("Please verify your email before logging in")
-        return _doc_to_user(doc)
-    except ValueError:
-        raise
-    except Exception as exc:
-        print(f"[db] MongoDB login failed: {exc} — using local fallback")
-        local_db = _load_local_db()
-        user_data = local_db["users"].get(clean_username)
-        if not user_data:
-            return None
-        expected = _hash_password(password, user_data["password_salt"])
-        if not secrets.compare_digest(expected, user_data["password_hash"]):
-            return None
-        if not user_data.get("verified", True):
-            raise ValueError("Please verify your email before logging in")
-        return {
-            "id": user_data["id"],
-            "username": user_data["username"],
-            "displayName": user_data["display_name"],
-            "createdAt": user_data["created_at"],
-        }
+    record = _load_json(_kv_get(_user_key(clean_username)))
+    if not record:
+        return None
+    expected = _hash_password(password, record["password_salt"])
+    if not secrets.compare_digest(expected, record["password_hash"]):
+        return None
+    if not record.get("verified", True):
+        raise ValueError("Please verify your email before logging in")
+    return _user_from_record(record)
 
 
 def verify_user_email(token: str) -> Optional[dict[str, Any]]:
-    try:
-        db = _get_db()
-        db.client.admin.command('ping')
-        doc = db["users"].find_one({"verification_token": token})
-        if not doc:
-            return None
-        if doc.get("verified"):
-            return _doc_to_user(doc)
-
-        expires = datetime.fromisoformat(doc["verification_expires"])
-        if datetime.now(timezone.utc) > expires:
-            raise ValueError("Verification link has expired")
-
-        db["users"].update_one(
-            {"_id": doc["_id"]},
-            {"$set": {"verified": True}, "$unset": {"verification_token": "", "verification_expires": ""}},
-        )
-        return _doc_to_user(doc)
-    except ValueError:
-        raise
-    except Exception as exc:
-        print(f"[db] MongoDB verify failed: {exc} — using local fallback")
-        local_db = _load_local_db()
-        for uname, user_data in local_db["users"].items():
-            if user_data.get("verification_token") == token:
-                if user_data.get("verified"):
-                    return {
-                        "id": user_data["id"],
-                        "username": user_data["username"],
-                        "displayName": user_data["display_name"],
-                        "createdAt": user_data["created_at"],
-                    }
-                expires = datetime.fromisoformat(user_data["verification_expires"])
-                if datetime.now(timezone.utc) > expires:
-                    raise ValueError("Verification link has expired")
-                user_data["verified"] = True
-                user_data.pop("verification_token", None)
-                user_data.pop("verification_expires", None)
-                _save_local_db(local_db)
-                return {
-                    "id": user_data["id"],
-                    "username": user_data["username"],
-                    "displayName": user_data["display_name"],
-                    "createdAt": user_data["created_at"],
-                }
+    username = _kv_get(_verify_key(token))
+    if not username:
         return None
+    record = _load_json(_kv_get(_user_key(username)))
+    if not record:
+        return None
+    if record.get("verified"):
+        return _user_from_record(record)
+    expires_raw = record.get("verification_expires")
+    if expires_raw and datetime.now(timezone.utc) > datetime.fromisoformat(expires_raw):
+        raise ValueError("Verification link has expired")
+    record["verified"] = True
+    record.pop("verification_token", None)
+    record.pop("verification_expires", None)
+    _kv_set(_user_key(username), _dump_json(record))
+    _kv_delete(_verify_key(token))
+    return _user_from_record(record)
 
 
 def resend_verification(username: str) -> Optional[str]:
     clean_username = username.strip().lower()
+    record = _load_json(_kv_get(_user_key(clean_username)))
+    if not record or record.get("verified"):
+        return None
+    old_token = record.get("verification_token")
     new_token = secrets.token_urlsafe(32)
     new_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
-    try:
-        db = _get_db()
-        db.client.admin.command('ping')
-        doc = db["users"].find_one({"username": clean_username})
-        if not doc or doc.get("verified"):
-            return None
-        db["users"].update_one(
-            {"_id": doc["_id"]},
-            {"$set": {"verification_token": new_token, "verification_expires": new_expires}},
-        )
-        return new_token
-    except Exception as exc:
-        print(f"[db] MongoDB resend failed: {exc} — using local fallback")
-        local_db = _load_local_db()
-        user_data = local_db["users"].get(clean_username)
-        if not user_data or user_data.get("verified"):
-            return None
-        user_data["verification_token"] = new_token
-        user_data["verification_expires"] = new_expires
-        _save_local_db(local_db)
-        return new_token
+    record["verification_token"] = new_token
+    record["verification_expires"] = new_expires
+    _kv_set(_user_key(clean_username), _dump_json(record))
+    if old_token:
+        _kv_delete(_verify_key(old_token))
+    _kv_set(_verify_key(new_token), clean_username)
+    return new_token
 
 
 def get_user(user_id: str) -> Optional[dict[str, Any]]:
-    try:
-        db = _get_db()
-        db.client.admin.command('ping')
-        doc = db["users"].find_one({"_id": user_id})
-        return _doc_to_user(doc) if doc else None
-    except Exception:
-        local_db = _load_local_db()
-        for u_data in local_db["users"].values():
-            if u_data["id"] == user_id:
-                return {
-                    "id": u_data["id"],
-                    "username": u_data["username"],
-                    "displayName": u_data["display_name"],
-                    "createdAt": u_data["created_at"],
-                }
+    username = _kv_get(_user_id_key(user_id))
+    if not username:
         return None
+    record = _load_json(_kv_get(_user_key(username)))
+    return _user_from_record(record) if record else None
+
+
+# ── Session tokens ────────────────────────────────────────────────────────────
+
+def _token_key(token: str) -> str:
+    return f"token:{token}"
 
 
 def issue_token(user_id: str, ttl_days: int = 30) -> str:
     token = secrets.token_urlsafe(32)
-    now = _utc_now()
     expires_at = (datetime.now(timezone.utc) + timedelta(days=ttl_days)).isoformat()
-    try:
-        db = _get_db()
-        db.client.admin.command('ping')
-        db["tokens"].insert_one({
-            "token": token,
-            "user_id": user_id,
-            "created_at": now,
-            "expires_at": expires_at,
-        })
-    except Exception as exc:
-        print(f"[db] MongoDB token issue failed: {exc} — using local fallback")
-        local_db = _load_local_db()
-        local_db["tokens"][token] = {
-            "token": token,
-            "user_id": user_id,
-            "created_at": now,
-            "expires_at": expires_at,
-        }
-        _save_local_db(local_db)
+    _kv_set(_token_key(token), _dump_json({
+        "user_id": user_id,
+        "created_at": _now(),
+        "expires_at": expires_at,
+    }))
     return token
 
 
 def revoke_token(token: str) -> None:
-    try:
-        db = _get_db()
-        db["tokens"].delete_one({"token": token})
-    except Exception:
-        local_db = _load_local_db()
-        if token in local_db["tokens"]:
-            del local_db["tokens"][token]
-            _save_local_db(local_db)
+    _kv_delete(_token_key(token))
 
 
 def get_user_by_token(token: str) -> Optional[dict[str, Any]]:
-    now = _utc_now()
-    try:
-        db = _get_db()
-        db.client.admin.command('ping')
-        tok_doc = db["tokens"].find_one({"token": token, "expires_at": {"$gt": now}})
-        if tok_doc is None:
-            return None
-        user_doc = db["users"].find_one({"_id": tok_doc["user_id"]})
-        return _doc_to_user(user_doc) if user_doc else None
-    except Exception as exc:
-        print(f"[db] MongoDB token verification failed: {exc} — using local fallback")
-        local_db = _load_local_db()
-        tok_data = local_db["tokens"].get(token)
-        if not tok_data or tok_data["expires_at"] <= now:
-            return None
-        user_id = tok_data["user_id"]
-        for u_data in local_db["users"].values():
-            if u_data["id"] == user_id:
-                return {
-                    "id": u_data["id"],
-                    "username": u_data["username"],
-                    "displayName": u_data["display_name"],
-                    "createdAt": u_data["created_at"],
-                }
+    data = _load_json(_kv_get(_token_key(token)))
+    if not data:
         return None
+    if data.get("expires_at") and data["expires_at"] <= _now():
+        return None
+    return get_user(data["user_id"])
 
 
-# ── Song helpers ─────────────────────────────────────────────────────────────
+# ── Song serialization ────────────────────────────────────────────────────────
 
 def _serialize_song(song: Any) -> dict[str, Any]:
     if isinstance(song, dict):
@@ -391,96 +297,150 @@ def _serialize_song(song: Any) -> dict[str, Any]:
     raise TypeError("Unsupported song payload")
 
 
-# ── Recent plays ─────────────────────────────────────────────────────────────
+# ── Recent plays ──────────────────────────────────────────────────────────────
+
+def _recent_key(user_id: str) -> str:
+    return f"recent:{user_id}"
+
 
 def record_recent_play(user_id: str, song: Any, limit: int = 50) -> None:
     song_doc = _serialize_song(song)
-    song_id = song_doc.get("id") or getattr(song, "id", None)
-    if not song_id:
-        return
-    db = _get_db()
-    db["recent_plays"].insert_one({
-        "user_id": user_id,
-        "song_id": str(song_id),
-        "song": song_doc,
-        "played_at": _utc_now(),
-    })
-    # Trim to limit — keep most recent
-    cursor = db["recent_plays"].find(
-        {"user_id": user_id},
-        sort=[("played_at", DESCENDING)]
-    ).skip(limit)
-    ids_to_delete = [d["_id"] for d in cursor]
-    if ids_to_delete:
-        db["recent_plays"].delete_many({"_id": {"$in": ids_to_delete}})
+    entry = _dump_json({"song": song_doc, "played_at": _now()})
+    key = _recent_key(user_id)
+    if _redis:
+        _redis.lpush(key, entry)
+        _redis.ltrim(key, 0, limit - 1)
+    else:
+        lst = list(_local_store.get(key, []))
+        lst.insert(0, entry)
+        _local_store[key] = lst[:limit]
 
 
 def list_recent_plays(user_id: str, limit: int = 20) -> list[dict[str, Any]]:
-    db = _get_db()
-    docs = db["recent_plays"].find(
-        {"user_id": user_id},
-        sort=[("played_at", DESCENDING)]
-    ).limit(limit)
-    return [d["song"] for d in docs]
+    key = _recent_key(user_id)
+    if _redis:
+        raw_list = _redis.lrange(key, 0, limit - 1) or []
+    else:
+        raw_list = list(_local_store.get(key, []))[:limit]
+    result = []
+    for raw in raw_list:
+        parsed = _load_json(raw)
+        if parsed and "song" in parsed:
+            result.append(parsed["song"])
+    return result
 
 
 # ── Favorites ─────────────────────────────────────────────────────────────────
+# Stored as a Redis hash where field = song_id, value = JSON song.
+
+def _favorites_key(user_id: str) -> str:
+    return f"favorites:{user_id}"
+
+
+def _hset(key: str, field: str, value: str) -> None:
+    if _redis:
+        _redis.hset(key, field, value)
+    else:
+        h = dict(_local_store.get(key, {}))
+        h[field] = value
+        _local_store[key] = h
+
+
+def _hdel(key: str, *fields: str) -> None:
+    if _redis:
+        _redis.hdel(key, *fields)
+    else:
+        h = dict(_local_store.get(key, {}))
+        for f in fields:
+            h.pop(f, None)
+        _local_store[key] = h
+
+
+def _hgetall(key: str) -> dict[str, str]:
+    if _redis:
+        return _redis.hgetall(key) or {}
+    return dict(_local_store.get(key, {}))
+
+
+def _hget(key: str, field: str) -> Optional[str]:
+    if _redis:
+        return _redis.hget(key, field)
+    return _local_store.get(key, {}).get(field)
+
 
 def toggle_favorite(user_id: str, song: Any) -> dict[str, Any]:
     song_doc = _serialize_song(song)
-    song_id = song_doc.get("id") or getattr(song, "id", None)
+    song_id = str(song_doc.get("id") or "")
     if not song_id:
         raise ValueError("Song id is required")
-    db = _get_db()
-    existing = db["favorites"].find_one({"user_id": user_id, "song_id": str(song_id)})
-    if existing:
-        db["favorites"].delete_one({"user_id": user_id, "song_id": str(song_id)})
+    key = _favorites_key(user_id)
+    if _hget(key, song_id):
+        _hdel(key, song_id)
         return {"liked": False}
-    db["favorites"].insert_one({
-        "user_id": user_id,
-        "song_id": str(song_id),
-        "song": song_doc,
-        "created_at": _utc_now(),
-    })
+    _hset(key, song_id, _dump_json({"song": song_doc, "created_at": _now()}))
     return {"liked": True}
 
 
 def list_favorites(user_id: str) -> list[dict[str, Any]]:
-    db = _get_db()
-    docs = db["favorites"].find(
-        {"user_id": user_id},
-        sort=[("created_at", DESCENDING)]
-    )
-    return [d["song"] for d in docs]
+    raw = _hgetall(_favorites_key(user_id))
+    entries: list[tuple[str, dict[str, Any]]] = []
+    for _, value in raw.items():
+        parsed = _load_json(value)
+        if parsed and "song" in parsed:
+            entries.append((parsed.get("created_at", ""), parsed["song"]))
+    entries.sort(key=lambda e: e[0], reverse=True)
+    return [song for _, song in entries]
 
 
 # ── Playlists ─────────────────────────────────────────────────────────────────
 
-def _playlist_tracks(db, playlist_id: str) -> list[dict[str, Any]]:
-    docs = db["playlist_items"].find(
-        {"playlist_id": playlist_id},
-        sort=[("position", ASCENDING)]
-    )
-    return [d["song"] for d in docs]
+def _playlist_key(playlist_id: str) -> str:
+    return f"playlist:{playlist_id}"
 
 
-def _doc_to_playlist(doc: dict, tracks: list) -> dict[str, Any]:
+def _playlist_items_key(playlist_id: str) -> str:
+    return f"playlist_items:{playlist_id}"
+
+
+def _user_playlists_key(user_id: str) -> str:
+    return f"user_playlists:{user_id}"
+
+
+def _record_to_playlist(rec: dict[str, Any], tracks: list[dict[str, Any]]) -> dict[str, Any]:
     return {
-        "id": doc["id"],
-        "name": doc["name"],
-        "description": doc.get("description", ""),
-        "isCollaborative": bool(doc.get("is_collaborative", False)),
-        "createdAt": doc.get("created_at", ""),
-        "updatedAt": doc.get("updated_at", ""),
+        "id": rec["id"],
+        "name": rec["name"],
+        "description": rec.get("description", ""),
+        "isCollaborative": bool(rec.get("is_collaborative", False)),
+        "createdAt": rec.get("created_at", ""),
+        "updatedAt": rec.get("updated_at", ""),
         "tracks": tracks,
     }
 
 
-def create_playlist(user_id: str, name: str, description: str = "", collaborative: bool = False) -> dict[str, Any]:
+def _read_playlist_tracks(playlist_id: str) -> list[dict[str, Any]]:
+    key = _playlist_items_key(playlist_id)
+    if _redis:
+        raw = _redis.lrange(key, 0, -1) or []
+    else:
+        raw = list(_local_store.get(key, []))
+    result = []
+    for r in raw:
+        parsed = _load_json(r)
+        if parsed:
+            result.append(parsed)
+    return result
+
+
+def create_playlist(
+    user_id: str,
+    name: str,
+    description: str = "",
+    collaborative: bool = False,
+) -> dict[str, Any]:
     playlist_id = secrets.token_hex(12)
-    now = _utc_now()
-    doc = {
-        "_id": playlist_id,
+    now = _now()
+    record = {
         "id": playlist_id,
         "user_id": user_id,
         "name": name.strip() or "Untitled Playlist",
@@ -489,26 +449,31 @@ def create_playlist(user_id: str, name: str, description: str = "", collaborativ
         "created_at": now,
         "updated_at": now,
     }
-    db = _get_db()
-    db["playlists"].insert_one(doc)
-    return _doc_to_playlist(doc, [])
+    _kv_set(_playlist_key(playlist_id), _dump_json(record))
+    _kv_set_add(_user_playlists_key(user_id), playlist_id)
+    return _record_to_playlist(record, [])
+
+
+def _load_playlist_record(playlist_id: str) -> Optional[dict[str, Any]]:
+    return _load_json(_kv_get(_playlist_key(playlist_id)))
 
 
 def list_playlists(user_id: str) -> list[dict[str, Any]]:
-    db = _get_db()
-    docs = db["playlists"].find(
-        {"user_id": user_id},
-        sort=[("updated_at", DESCENDING)]
-    )
-    return [_doc_to_playlist(d, _playlist_tracks(db, d["id"])) for d in docs]
+    ids = _kv_set_members(_user_playlists_key(user_id))
+    records = []
+    for pid in ids:
+        rec = _load_playlist_record(pid)
+        if rec:
+            records.append(rec)
+    records.sort(key=lambda r: r.get("updated_at", ""), reverse=True)
+    return [_record_to_playlist(r, _read_playlist_tracks(r["id"])) for r in records]
 
 
 def get_playlist(user_id: str, playlist_id: str) -> Optional[dict[str, Any]]:
-    db = _get_db()
-    doc = db["playlists"].find_one({"id": playlist_id, "user_id": user_id})
-    if doc is None:
+    rec = _load_playlist_record(playlist_id)
+    if not rec or rec.get("user_id") != user_id:
         return None
-    return _doc_to_playlist(doc, _playlist_tracks(db, playlist_id))
+    return _record_to_playlist(rec, _read_playlist_tracks(playlist_id))
 
 
 def update_playlist(
@@ -519,81 +484,99 @@ def update_playlist(
     description: Optional[str] = None,
     collaborative: Optional[bool] = None,
 ) -> Optional[dict[str, Any]]:
-    updates: dict[str, Any] = {"updated_at": _utc_now()}
+    rec = _load_playlist_record(playlist_id)
+    if not rec or rec.get("user_id") != user_id:
+        return None
     if name is not None:
-        updates["name"] = name.strip() or "Untitled Playlist"
+        rec["name"] = name.strip() or "Untitled Playlist"
     if description is not None:
-        updates["description"] = description.strip()
+        rec["description"] = description.strip()
     if collaborative is not None:
-        updates["is_collaborative"] = bool(collaborative)
-    db = _get_db()
-    db["playlists"].update_one({"id": playlist_id, "user_id": user_id}, {"$set": updates})
+        rec["is_collaborative"] = bool(collaborative)
+    rec["updated_at"] = _now()
+    _kv_set(_playlist_key(playlist_id), _dump_json(rec))
     return get_playlist(user_id, playlist_id)
 
 
 def delete_playlist(user_id: str, playlist_id: str) -> bool:
-    db = _get_db()
-    result = db["playlists"].delete_one({"id": playlist_id, "user_id": user_id})
-    if result.deleted_count > 0:
-        db["playlist_items"].delete_many({"playlist_id": playlist_id})
-        return True
-    return False
+    rec = _load_playlist_record(playlist_id)
+    if not rec or rec.get("user_id") != user_id:
+        return False
+    _kv_delete(_playlist_key(playlist_id), _playlist_items_key(playlist_id))
+    _kv_set_remove(_user_playlists_key(user_id), playlist_id)
+    return True
 
 
 def add_song_to_playlist(user_id: str, playlist_id: str, song: Any) -> Optional[dict[str, Any]]:
+    rec = _load_playlist_record(playlist_id)
+    if not rec or rec.get("user_id") != user_id:
+        return None
     song_doc = _serialize_song(song)
-    db = _get_db()
-    if not db["playlists"].find_one({"id": playlist_id, "user_id": user_id}):
-        return None
-    last = db["playlist_items"].find_one(
-        {"playlist_id": playlist_id},
-        sort=[("position", DESCENDING)]
-    )
-    next_pos = (last["position"] + 1) if last else 1
-    db["playlist_items"].insert_one({
-        "playlist_id": playlist_id,
-        "position": next_pos,
-        "song": song_doc,
-        "added_at": _utc_now(),
-    })
-    db["playlists"].update_one({"id": playlist_id}, {"$set": {"updated_at": _utc_now()}})
+    entry = _dump_json(song_doc)
+    key = _playlist_items_key(playlist_id)
+    if _redis:
+        _redis.rpush(key, entry)
+    else:
+        lst = list(_local_store.get(key, []))
+        lst.append(entry)
+        _local_store[key] = lst
+    rec["updated_at"] = _now()
+    _kv_set(_playlist_key(playlist_id), _dump_json(rec))
     return get_playlist(user_id, playlist_id)
 
 
-def remove_song_from_playlist(user_id: str, playlist_id: str, song_id: str) -> Optional[dict[str, Any]]:
-    db = _get_db()
-    if not db["playlists"].find_one({"id": playlist_id, "user_id": user_id}):
+def remove_song_from_playlist(
+    user_id: str, playlist_id: str, song_id: str
+) -> Optional[dict[str, Any]]:
+    rec = _load_playlist_record(playlist_id)
+    if not rec or rec.get("user_id") != user_id:
         return None
-    db["playlist_items"].delete_many({"playlist_id": playlist_id, "song.id": song_id})
-    db["playlists"].update_one({"id": playlist_id}, {"$set": {"updated_at": _utc_now()}})
+    tracks = _read_playlist_tracks(playlist_id)
+    remaining = [t for t in tracks if str(t.get("id")) != str(song_id)]
+    _write_playlist_tracks(playlist_id, remaining)
+    rec["updated_at"] = _now()
+    _kv_set(_playlist_key(playlist_id), _dump_json(rec))
     return get_playlist(user_id, playlist_id)
 
 
-def reorder_playlist_track(user_id: str, playlist_id: str, song_id: str, position: int) -> Optional[dict[str, Any]]:
-    db = _get_db()
-    if not db["playlists"].find_one({"id": playlist_id, "user_id": user_id}):
+def reorder_playlist_track(
+    user_id: str, playlist_id: str, song_id: str, position: int
+) -> Optional[dict[str, Any]]:
+    rec = _load_playlist_record(playlist_id)
+    if not rec or rec.get("user_id") != user_id:
         return None
-    items = list(db["playlist_items"].find(
-        {"playlist_id": playlist_id},
-        sort=[("position", ASCENDING)]
-    ))
-    moving = next((i for i in items if i.get("song", {}).get("id") == song_id), None)
+    tracks = _read_playlist_tracks(playlist_id)
+    moving = next((t for t in tracks if str(t.get("id")) == str(song_id)), None)
     if moving is None:
         return get_playlist(user_id, playlist_id)
-    rest = [i for i in items if i.get("song", {}).get("id") != song_id]
+    rest = [t for t in tracks if str(t.get("id")) != str(song_id)]
     insert_at = max(0, min(position, len(rest)))
     rest.insert(insert_at, moving)
-    for idx, item in enumerate(rest, start=1):
-        db["playlist_items"].update_one({"_id": item["_id"]}, {"$set": {"position": idx}})
-    db["playlists"].update_one({"id": playlist_id}, {"$set": {"updated_at": _utc_now()}})
+    _write_playlist_tracks(playlist_id, rest)
+    rec["updated_at"] = _now()
+    _kv_set(_playlist_key(playlist_id), _dump_json(rec))
     return get_playlist(user_id, playlist_id)
+
+
+def _write_playlist_tracks(playlist_id: str, tracks: list[dict[str, Any]]) -> None:
+    key = _playlist_items_key(playlist_id)
+    _kv_delete(key)
+    if not tracks:
+        return
+    entries = [_dump_json(t) for t in tracks]
+    if _redis:
+        _redis.rpush(key, *entries)
+    else:
+        _local_store[key] = entries
 
 
 def export_playlists(user_id: str) -> list[dict[str, Any]]:
     return list_playlists(user_id)
 
 
-def import_playlists(user_id: str, playlists: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+def import_playlists(
+    user_id: str, playlists: Iterable[dict[str, Any]]
+) -> list[dict[str, Any]]:
     created: list[dict[str, Any]] = []
     for playlist in playlists:
         item = create_playlist(
@@ -609,42 +592,40 @@ def import_playlists(user_id: str, playlists: Iterable[dict[str, Any]]) -> list[
     return created
 
 
-# ── Analytics ─────────────────────────────────────────────────────────────────
-
-def analytics_summary(user_id: str) -> dict[str, Any]:
-    db = _get_db()
-    favorites_count = db["favorites"].count_documents({"user_id": user_id})
-    playlists_count = db["playlists"].count_documents({"user_id": user_id})
-    recent_count = db["recent_plays"].count_documents({"user_id": user_id})
-    events_count = db["analytics_events"].count_documents({"user_id": user_id})
-    pipeline = [
-        {"$match": {"user_id": user_id}},
-        {"$group": {"_id": "$song_id", "song": {"$first": "$song"}, "plays": {"$sum": 1}}},
-        {"$sort": {"plays": -1}},
-        {"$limit": 5},
-    ]
-    top_docs = list(db["recent_plays"].aggregate(pipeline))
-    return {
-        "favoritesCount": int(favorites_count),
-        "playlistsCount": int(playlists_count),
-        "recentPlaysCount": int(recent_count),
-        "eventCount": int(events_count),
-        "topTracks": [d["song"] for d in top_docs],
-    }
-
-
 # ── Playback state ────────────────────────────────────────────────────────────
 
+def _playback_key(user_id: str) -> str:
+    return f"playback:{user_id}"
+
+
 def save_playback_state(user_id: str, state: dict[str, Any]) -> None:
-    db = _get_db()
-    db["playback_state"].update_one(
-        {"user_id": user_id},
-        {"$set": {"state": state, "updated_at": _utc_now()}},
-        upsert=True,
-    )
+    _kv_set(_playback_key(user_id), _dump_json({"state": state, "updated_at": _now()}))
 
 
 def load_playback_state(user_id: str) -> dict[str, Any] | None:
-    db = _get_db()
-    doc = db["playback_state"].find_one({"user_id": user_id})
-    return doc["state"] if doc else None
+    data = _load_json(_kv_get(_playback_key(user_id)))
+    return data.get("state") if data else None
+
+
+# ── Analytics ─────────────────────────────────────────────────────────────────
+
+def analytics_summary(user_id: str) -> dict[str, Any]:
+    favorites = list_favorites(user_id)
+    playlists = list_playlists(user_id)
+    recent = list_recent_plays(user_id, limit=200)
+    play_count: dict[str, int] = {}
+    song_lookup: dict[str, dict[str, Any]] = {}
+    for song in recent:
+        sid = str(song.get("id", ""))
+        if not sid:
+            continue
+        play_count[sid] = play_count.get(sid, 0) + 1
+        song_lookup[sid] = song
+    top_ids = sorted(play_count.keys(), key=lambda s: play_count[s], reverse=True)[:5]
+    return {
+        "favoritesCount": len(favorites),
+        "playlistsCount": len(playlists),
+        "recentPlaysCount": len(recent),
+        "eventCount": 0,
+        "topTracks": [song_lookup[sid] for sid in top_ids],
+    }
