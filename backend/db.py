@@ -48,13 +48,16 @@ def _get_db():
             "connectTimeoutMS": 10000,
             "socketTimeoutMS": 10000,
             "retryWrites": True,
-            "tlsDisableOCSPEndpointCheck": True,
         }
         if MONGODB_URI.startswith("mongodb+srv://") or "ssl=true" in MONGODB_URI or "tls=true" in MONGODB_URI:
             kwargs["tls"] = True
             kwargs["tlsCAFile"] = certifi.where()
             kwargs["tlsAllowInvalidCertificates"] = True
-        _client = MongoClient(MONGODB_URI, **kwargs)
+        try:
+            _client = MongoClient(MONGODB_URI, **kwargs)
+        except Exception as exc:
+            print(f"[db] MongoClient init failed: {exc}")
+            raise
     return _client["musicwave"]
 
 
