@@ -8,7 +8,7 @@ from typing import Any, List, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
-from fastapi.responses import Response, FileResponse
+from fastapi.responses import Response, FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -816,35 +816,23 @@ _BROWSER_HEADERS = {
 
 @app.get('/api/track-audio/{track_id}')
 async def track_audio(track_id: str):
-    """Fetch a FRESH Deezer preview URL for the given track ID and stream the audio.
+    """Fetch a FRESH Deezer preview URL for the given track ID and 302-redirect to it.
 
-    Deezer's preview URLs contain a short-lived signature. Fetching a new one on every
-    play request ensures the URL is never stale by the time the browser downloads it.
+    Deezer preview URLs contain a short-lived signature; fetching a new one on every
+    play request ensures the URL is never stale. We redirect (rather than proxy audio
+    bytes through Vercel) so the browser downloads directly from Deezer's CDN —
+    faster, no serverless timeout risk, no bandwidth cost on Vercel.
     """
     try:
-        async with httpx.AsyncClient(timeout=15, headers=_BROWSER_HEADERS) as client:
+        async with httpx.AsyncClient(timeout=8, headers=_BROWSER_HEADERS) as client:
             api_resp = await client.get(f'https://api.deezer.com/track/{track_id}')
-            if api_resp.status_code != 200:
-                return Response(content='Track not found', status_code=404)
-            preview_url = api_resp.json().get('preview')
-            if not preview_url:
-                return Response(content='No preview available for this track', status_code=404)
-
-            audio_resp = await client.get(preview_url, follow_redirects=True)
-
-        if audio_resp.status_code >= 400:
-            print(f"[track-audio] Deezer CDN returned {audio_resp.status_code} for track {track_id}")
-            return Response(content='Preview fetch failed', status_code=502)
-
-        return Response(
-            content=audio_resp.content,
-            media_type='audio/mpeg',
-            headers={
-                'Cache-Control': 'public, max-age=300',
-                'Access-Control-Allow-Origin': '*',
-                'Accept-Ranges': 'bytes',
-            },
-        )
+        if api_resp.status_code != 200:
+            print(f"[track-audio] Deezer API returned {api_resp.status_code} for track {track_id}")
+            return Response(content='Track not found', status_code=404)
+        preview_url = api_resp.json().get('preview')
+        if not preview_url:
+            return Response(content='No preview available for this track', status_code=404)
+        return RedirectResponse(url=preview_url, status_code=302)
     except Exception as exc:
         print(f"[track-audio] error for {track_id}: {exc}")
         return Response(content=f'Fetch failed: {exc}', status_code=502)
