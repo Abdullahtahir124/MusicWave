@@ -849,11 +849,7 @@ async def register(payload: AuthRequest):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except Exception as exc:
         err_msg = str(exc)
-        if 'ServerSelectionTimeoutError' in err_msg or 'timed out' in err_msg.lower() or 'connection' in err_msg.lower():
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail='Cannot reach the database. Please check your internet connection and try again.'
-            ) from exc
+        print(f"[backend] Registration exception: {type(exc).__name__}: {err_msg}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f'Registration failed: {err_msg}') from exc
 
     if requires_verification:
@@ -911,11 +907,7 @@ async def login(payload: AuthRequest):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     except Exception as exc:
         err_msg = str(exc)
-        if 'ServerSelectionTimeoutError' in err_msg or 'timed out' in err_msg.lower() or 'connection' in err_msg.lower():
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail='Cannot reach the database. Please check your internet connection and try again.'
-            ) from exc
+        print(f"[backend] Login exception: {type(exc).__name__}: {err_msg}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f'Login failed: {err_msg}') from exc
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Invalid username or password')

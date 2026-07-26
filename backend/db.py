@@ -1,8 +1,10 @@
 """
-User + playlist storage backed by Upstash Redis (Vercel KV).
+User + playlist storage backed by Supabase (Postgres via HTTPS REST API).
 
-Uses HTTPS-based REST API — no TLS driver issues on serverless runtimes.
-Falls back to an in-process dict if no Redis env vars are configured (local dev).
+Uses the supabase-py client which talks to Supabase over HTTPS —
+no TLS driver issues on serverless runtimes.
+
+Falls back to an in-process dict if no Supabase env vars are configured (local dev).
 
 Function signatures are kept identical to the previous MongoDB-based implementation
 so backend/main.py does not need any changes.
@@ -21,22 +23,28 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-# ── Redis client (Upstash / Vercel KV) ────────────────────────────────────────
-# Vercel KV injects KV_REST_API_URL / KV_REST_API_TOKEN.
-# Upstash direct: UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN.
-_REDIS_URL = os.getenv("KV_REST_API_URL") or os.getenv("UPSTASH_REDIS_REST_URL")
-_REDIS_TOKEN = os.getenv("KV_REST_API_TOKEN") or os.getenv("UPSTASH_REDIS_REST_TOKEN")
+# ── Supabase client ───────────────────────────────────────────────────────────
+_SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+_SUPABASE_KEY = (
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    or os.getenv("SUPABASE_KEY")
+    or os.getenv("SUPABASE_ANON_KEY")
+    or ""
+).strip()
 
-_redis = None
-_local_store: dict[str, Any] = {}  # in-process fallback for local dev without Redis
+_client = None
+_local_store: dict[str, list[dict[str, Any]]] = {  # in-process fallback
+    "users": [], "tokens": [], "favorites": [], "recent_plays": [],
+    "playlists": [], "playlist_items": [], "playback_state": [],
+}
 
-if _REDIS_URL and _REDIS_TOKEN:
+if _SUPABASE_URL and _SUPABASE_KEY:
     try:
-        from upstash_redis import Redis
-        _redis = Redis(url=_REDIS_URL, token=_REDIS_TOKEN)
+        from supabase import create_client
+        _client = create_client(_SUPABASE_URL, _SUPABASE_KEY)
     except Exception as exc:  # pragma: no cover
-        print(f"[db] Failed to init Upstash client: {exc}")
-        _redis = None
+        print(f"[db] Failed to init Supabase client: {exc}")
+        _client = None
 
 
 def _now() -> str:
@@ -49,104 +57,44 @@ def _hash_password(password: str, salt: str) -> str:
     ).hex()
 
 
-# ── Low-level KV wrappers ─────────────────────────────────────────────────────
-# We expose get/set/delete/list-manipulation methods that work either against
-# real Upstash Redis or the local in-process dict fallback.
-
-def _kv_get(key: str) -> Optional[str]:
-    if _redis:
-        return _redis.get(key)
-    return _local_store.get(key)
-
-
-def _kv_set(key: str, value: str) -> None:
-    if _redis:
-        _redis.set(key, value)
-    else:
-        _local_store[key] = value
-
-
-def _kv_delete(*keys: str) -> None:
-    if not keys:
-        return
-    if _redis:
-        _redis.delete(*keys)
-    else:
-        for k in keys:
-            _local_store.pop(k, None)
-
-
-def _kv_set_add(key: str, *members: str) -> None:
-    if _redis:
-        _redis.sadd(key, *members)
-    else:
-        s: set[str] = set(_local_store.get(key, set()))
-        s.update(members)
-        _local_store[key] = s
-
-
-def _kv_set_remove(key: str, *members: str) -> None:
-    if _redis:
-        _redis.srem(key, *members)
-    else:
-        s: set[str] = set(_local_store.get(key, set()))
-        s.difference_update(members)
-        _local_store[key] = s
-
-
-def _kv_set_members(key: str) -> list[str]:
-    if _redis:
-        return list(_redis.smembers(key) or [])
-    return list(_local_store.get(key, set()))
-
-
-def _load_json(raw: Optional[str], default: Any = None) -> Any:
-    if not raw:
-        return default
-    try:
-        return json.loads(raw)
-    except Exception:
-        return default
-
-
-def _dump_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False)
-
-
 # ── init ──────────────────────────────────────────────────────────────────────
 
 def init_database() -> None:
-    """No-op — Redis needs no schema, but we ping to warm connection & surface errors early."""
-    if _redis is None:
-        print("[db] No Redis configured — using in-process fallback (data will be lost on restart)")
-        return
-    try:
-        _redis.set("__init__", _now())
-    except Exception as exc:
-        print(f"[db] Redis ping failed: {exc}")
+    """No-op — schema is managed via SQL in the Supabase dashboard."""
+    if _client is None:
+        print("[db] No Supabase configured — using in-process fallback (data lost on restart)")
 
 
 # ── User helpers ──────────────────────────────────────────────────────────────
 
-def _user_key(username: str) -> str:
-    return f"user:{username.strip().lower()}"
-
-
-def _user_id_key(user_id: str) -> str:
-    return f"user_id:{user_id}"
-
-
-def _verify_key(token: str) -> str:
-    return f"verify:{token}"
-
-
-def _user_from_record(rec: dict[str, Any]) -> dict[str, Any]:
+def _user_to_public(rec: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": rec["id"],
         "username": rec["username"],
         "displayName": rec.get("display_name", ""),
         "createdAt": rec.get("created_at", ""),
     }
+
+
+def _local_find(table: str, **filters: Any) -> list[dict[str, Any]]:
+    rows = _local_store.get(table, [])
+    return [r for r in rows if all(r.get(k) == v for k, v in filters.items())]
+
+
+def _local_upsert(table: str, row: dict[str, Any], key: str) -> None:
+    rows = _local_store.setdefault(table, [])
+    for i, existing in enumerate(rows):
+        if existing.get(key) == row.get(key):
+            rows[i] = row
+            return
+    rows.append(row)
+
+
+def _local_delete(table: str, **filters: Any) -> int:
+    rows = _local_store.get(table, [])
+    remaining = [r for r in rows if not all(r.get(k) == v for k, v in filters.items())]
+    _local_store[table] = remaining
+    return len(rows) - len(remaining)
 
 
 def create_user(
@@ -162,15 +110,24 @@ def create_user(
     if len(password) < 6:
         raise ValueError("Password must be at least 6 characters long")
 
-    if _kv_get(_user_key(clean_username)):
-        raise ValueError("Username already exists")
+    # Duplicate check
+    if _client:
+        existing = _client.table("users").select("id").eq("username", clean_username).execute()
+        if existing.data:
+            raise ValueError("Username already exists")
+    else:
+        if _local_find("users", username=clean_username):
+            raise ValueError("Username already exists")
 
     salt = secrets.token_hex(16)
     user_id = secrets.token_hex(12)
     display = (display_name or clean_username.split("@")[0] or "Listener").strip() or "Listener"
-    verification_token = secrets.token_urlsafe(32)
-    verification_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    now = _now()
     verified = skip_verification
+    verification_token = None if verified else secrets.token_urlsafe(32)
+    verification_expires = None if verified else (
+        datetime.now(timezone.utc) + timedelta(hours=24)
+    ).isoformat()
 
     record = {
         "id": user_id,
@@ -179,27 +136,31 @@ def create_user(
         "password_hash": _hash_password(password, salt),
         "password_salt": salt,
         "verified": verified,
-        "created_at": _now(),
+        "verification_token": verification_token,
+        "verification_expires": verification_expires,
+        "created_at": now,
     }
-    if not verified:
-        record["verification_token"] = verification_token
-        record["verification_expires"] = verification_expires
 
-    _kv_set(_user_key(clean_username), _dump_json(record))
-    _kv_set(_user_id_key(user_id), clean_username)
-    if not verified:
-        _kv_set(_verify_key(verification_token), clean_username)
+    if _client:
+        _client.table("users").insert(record).execute()
+    else:
+        _local_store["users"].append(record)
 
-    result = _user_from_record(record)
+    result = _user_to_public(record)
     result["verified"] = verified
-    if not verified:
+    if verification_token:
         result["verification_token"] = verification_token
     return result
 
 
 def authenticate_user(username: str, password: str) -> Optional[dict[str, Any]]:
     clean_username = username.strip().lower()
-    record = _load_json(_kv_get(_user_key(clean_username)))
+    if _client:
+        res = _client.table("users").select("*").eq("username", clean_username).limit(1).execute()
+        record = res.data[0] if res.data else None
+    else:
+        rows = _local_find("users", username=clean_username)
+        record = rows[0] if rows else None
     if not record:
         return None
     expected = _hash_password(password, record["password_salt"])
@@ -207,82 +168,95 @@ def authenticate_user(username: str, password: str) -> Optional[dict[str, Any]]:
         return None
     if not record.get("verified", True):
         raise ValueError("Please verify your email before logging in")
-    return _user_from_record(record)
+    return _user_to_public(record)
 
 
 def verify_user_email(token: str) -> Optional[dict[str, Any]]:
-    username = _kv_get(_verify_key(token))
-    if not username:
-        return None
-    record = _load_json(_kv_get(_user_key(username)))
+    if _client:
+        res = _client.table("users").select("*").eq("verification_token", token).limit(1).execute()
+        record = res.data[0] if res.data else None
+    else:
+        rows = _local_find("users", verification_token=token)
+        record = rows[0] if rows else None
     if not record:
         return None
     if record.get("verified"):
-        return _user_from_record(record)
+        return _user_to_public(record)
     expires_raw = record.get("verification_expires")
     if expires_raw and datetime.now(timezone.utc) > datetime.fromisoformat(expires_raw):
         raise ValueError("Verification link has expired")
-    record["verified"] = True
-    record.pop("verification_token", None)
-    record.pop("verification_expires", None)
-    _kv_set(_user_key(username), _dump_json(record))
-    _kv_delete(_verify_key(token))
-    return _user_from_record(record)
+    updates = {"verified": True, "verification_token": None, "verification_expires": None}
+    if _client:
+        _client.table("users").update(updates).eq("id", record["id"]).execute()
+    else:
+        record.update(updates)
+    return _user_to_public(record)
 
 
 def resend_verification(username: str) -> Optional[str]:
     clean_username = username.strip().lower()
-    record = _load_json(_kv_get(_user_key(clean_username)))
+    if _client:
+        res = _client.table("users").select("*").eq("username", clean_username).limit(1).execute()
+        record = res.data[0] if res.data else None
+    else:
+        rows = _local_find("users", username=clean_username)
+        record = rows[0] if rows else None
     if not record or record.get("verified"):
         return None
-    old_token = record.get("verification_token")
     new_token = secrets.token_urlsafe(32)
     new_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
-    record["verification_token"] = new_token
-    record["verification_expires"] = new_expires
-    _kv_set(_user_key(clean_username), _dump_json(record))
-    if old_token:
-        _kv_delete(_verify_key(old_token))
-    _kv_set(_verify_key(new_token), clean_username)
+    updates = {"verification_token": new_token, "verification_expires": new_expires}
+    if _client:
+        _client.table("users").update(updates).eq("id", record["id"]).execute()
+    else:
+        record.update(updates)
     return new_token
 
 
 def get_user(user_id: str) -> Optional[dict[str, Any]]:
-    username = _kv_get(_user_id_key(user_id))
-    if not username:
-        return None
-    record = _load_json(_kv_get(_user_key(username)))
-    return _user_from_record(record) if record else None
+    if _client:
+        res = _client.table("users").select("*").eq("id", user_id).limit(1).execute()
+        record = res.data[0] if res.data else None
+    else:
+        rows = _local_find("users", id=user_id)
+        record = rows[0] if rows else None
+    return _user_to_public(record) if record else None
 
 
 # ── Session tokens ────────────────────────────────────────────────────────────
 
-def _token_key(token: str) -> str:
-    return f"token:{token}"
-
-
 def issue_token(user_id: str, ttl_days: int = 30) -> str:
     token = secrets.token_urlsafe(32)
+    now = _now()
     expires_at = (datetime.now(timezone.utc) + timedelta(days=ttl_days)).isoformat()
-    _kv_set(_token_key(token), _dump_json({
-        "user_id": user_id,
-        "created_at": _now(),
-        "expires_at": expires_at,
-    }))
+    row = {"token": token, "user_id": user_id, "created_at": now, "expires_at": expires_at}
+    if _client:
+        _client.table("tokens").insert(row).execute()
+    else:
+        _local_store["tokens"].append(row)
     return token
 
 
 def revoke_token(token: str) -> None:
-    _kv_delete(_token_key(token))
+    if _client:
+        _client.table("tokens").delete().eq("token", token).execute()
+    else:
+        _local_delete("tokens", token=token)
 
 
 def get_user_by_token(token: str) -> Optional[dict[str, Any]]:
-    data = _load_json(_kv_get(_token_key(token)))
-    if not data:
+    now = _now()
+    if _client:
+        res = _client.table("tokens").select("*").eq("token", token).limit(1).execute()
+        tok = res.data[0] if res.data else None
+    else:
+        rows = _local_find("tokens", token=token)
+        tok = rows[0] if rows else None
+    if not tok:
         return None
-    if data.get("expires_at") and data["expires_at"] <= _now():
+    if tok.get("expires_at") and tok["expires_at"] <= now:
         return None
-    return get_user(data["user_id"])
+    return get_user(tok["user_id"])
 
 
 # ── Song serialization ────────────────────────────────────────────────────────
@@ -299,112 +273,78 @@ def _serialize_song(song: Any) -> dict[str, Any]:
 
 # ── Recent plays ──────────────────────────────────────────────────────────────
 
-def _recent_key(user_id: str) -> str:
-    return f"recent:{user_id}"
-
-
 def record_recent_play(user_id: str, song: Any, limit: int = 50) -> None:
     song_doc = _serialize_song(song)
-    entry = _dump_json({"song": song_doc, "played_at": _now()})
-    key = _recent_key(user_id)
-    if _redis:
-        _redis.lpush(key, entry)
-        _redis.ltrim(key, 0, limit - 1)
+    song_id = str(song_doc.get("id") or "")
+    if not song_id:
+        return
+    row = {"user_id": user_id, "song_id": song_id, "song": song_doc, "played_at": _now()}
+    if _client:
+        _client.table("recent_plays").insert(row).execute()
+        # Trim: fetch ids past the limit and delete them
+        res = _client.table("recent_plays").select("id").eq("user_id", user_id).order(
+            "played_at", desc=True
+        ).range(limit, limit + 1000).execute()
+        old_ids = [r["id"] for r in (res.data or [])]
+        if old_ids:
+            _client.table("recent_plays").delete().in_("id", old_ids).execute()
     else:
-        lst = list(_local_store.get(key, []))
-        lst.insert(0, entry)
-        _local_store[key] = lst[:limit]
+        _local_store["recent_plays"].append(row)
 
 
 def list_recent_plays(user_id: str, limit: int = 20) -> list[dict[str, Any]]:
-    key = _recent_key(user_id)
-    if _redis:
-        raw_list = _redis.lrange(key, 0, limit - 1) or []
-    else:
-        raw_list = list(_local_store.get(key, []))[:limit]
-    result = []
-    for raw in raw_list:
-        parsed = _load_json(raw)
-        if parsed and "song" in parsed:
-            result.append(parsed["song"])
-    return result
+    if _client:
+        res = _client.table("recent_plays").select("song,played_at").eq(
+            "user_id", user_id
+        ).order("played_at", desc=True).limit(limit).execute()
+        return [r["song"] for r in (res.data or [])]
+    rows = [r for r in _local_store["recent_plays"] if r["user_id"] == user_id]
+    rows.sort(key=lambda r: r.get("played_at", ""), reverse=True)
+    return [r["song"] for r in rows[:limit]]
 
 
 # ── Favorites ─────────────────────────────────────────────────────────────────
-# Stored as a Redis hash where field = song_id, value = JSON song.
-
-def _favorites_key(user_id: str) -> str:
-    return f"favorites:{user_id}"
-
-
-def _hset(key: str, field: str, value: str) -> None:
-    if _redis:
-        _redis.hset(key, field, value)
-    else:
-        h = dict(_local_store.get(key, {}))
-        h[field] = value
-        _local_store[key] = h
-
-
-def _hdel(key: str, *fields: str) -> None:
-    if _redis:
-        _redis.hdel(key, *fields)
-    else:
-        h = dict(_local_store.get(key, {}))
-        for f in fields:
-            h.pop(f, None)
-        _local_store[key] = h
-
-
-def _hgetall(key: str) -> dict[str, str]:
-    if _redis:
-        return _redis.hgetall(key) or {}
-    return dict(_local_store.get(key, {}))
-
-
-def _hget(key: str, field: str) -> Optional[str]:
-    if _redis:
-        return _redis.hget(key, field)
-    return _local_store.get(key, {}).get(field)
-
 
 def toggle_favorite(user_id: str, song: Any) -> dict[str, Any]:
     song_doc = _serialize_song(song)
     song_id = str(song_doc.get("id") or "")
     if not song_id:
         raise ValueError("Song id is required")
-    key = _favorites_key(user_id)
-    if _hget(key, song_id):
-        _hdel(key, song_id)
+    if _client:
+        existing = _client.table("favorites").select("id").eq("user_id", user_id).eq(
+            "song_id", song_id
+        ).execute()
+        if existing.data:
+            _client.table("favorites").delete().eq("user_id", user_id).eq(
+                "song_id", song_id
+            ).execute()
+            return {"liked": False}
+        _client.table("favorites").insert({
+            "user_id": user_id, "song_id": song_id, "song": song_doc, "created_at": _now(),
+        }).execute()
+        return {"liked": True}
+    matches = _local_find("favorites", user_id=user_id, song_id=song_id)
+    if matches:
+        _local_delete("favorites", user_id=user_id, song_id=song_id)
         return {"liked": False}
-    _hset(key, song_id, _dump_json({"song": song_doc, "created_at": _now()}))
+    _local_store["favorites"].append({
+        "user_id": user_id, "song_id": song_id, "song": song_doc, "created_at": _now(),
+    })
     return {"liked": True}
 
 
 def list_favorites(user_id: str) -> list[dict[str, Any]]:
-    raw = _hgetall(_favorites_key(user_id))
-    entries: list[tuple[str, dict[str, Any]]] = []
-    for _, value in raw.items():
-        parsed = _load_json(value)
-        if parsed and "song" in parsed:
-            entries.append((parsed.get("created_at", ""), parsed["song"]))
-    entries.sort(key=lambda e: e[0], reverse=True)
-    return [song for _, song in entries]
+    if _client:
+        res = _client.table("favorites").select("song,created_at").eq(
+            "user_id", user_id
+        ).order("created_at", desc=True).execute()
+        return [r["song"] for r in (res.data or [])]
+    rows = [r for r in _local_store["favorites"] if r["user_id"] == user_id]
+    rows.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    return [r["song"] for r in rows]
 
 
 # ── Playlists ─────────────────────────────────────────────────────────────────
-
-def _playlist_key(playlist_id: str) -> str:
-    return f"playlist:{playlist_id}"
-
-
-def _playlist_items_key(playlist_id: str) -> str:
-    return f"playlist_items:{playlist_id}"
-
-
-def _user_playlists_key(user_id: str) -> str:
-    return f"user_playlists:{user_id}"
-
 
 def _record_to_playlist(rec: dict[str, Any], tracks: list[dict[str, Any]]) -> dict[str, Any]:
     return {
@@ -418,29 +358,23 @@ def _record_to_playlist(rec: dict[str, Any], tracks: list[dict[str, Any]]) -> di
     }
 
 
-def _read_playlist_tracks(playlist_id: str) -> list[dict[str, Any]]:
-    key = _playlist_items_key(playlist_id)
-    if _redis:
-        raw = _redis.lrange(key, 0, -1) or []
-    else:
-        raw = list(_local_store.get(key, []))
-    result = []
-    for r in raw:
-        parsed = _load_json(r)
-        if parsed:
-            result.append(parsed)
-    return result
+def _list_tracks(playlist_id: str) -> list[dict[str, Any]]:
+    if _client:
+        res = _client.table("playlist_items").select("song,position").eq(
+            "playlist_id", playlist_id
+        ).order("position", desc=False).execute()
+        return [r["song"] for r in (res.data or [])]
+    rows = [r for r in _local_store["playlist_items"] if r["playlist_id"] == playlist_id]
+    rows.sort(key=lambda r: r.get("position", 0))
+    return [r["song"] for r in rows]
 
 
 def create_playlist(
-    user_id: str,
-    name: str,
-    description: str = "",
-    collaborative: bool = False,
+    user_id: str, name: str, description: str = "", collaborative: bool = False
 ) -> dict[str, Any]:
     playlist_id = secrets.token_hex(12)
     now = _now()
-    record = {
+    rec = {
         "id": playlist_id,
         "user_id": user_id,
         "name": name.strip() or "Untitled Playlist",
@@ -449,125 +383,185 @@ def create_playlist(
         "created_at": now,
         "updated_at": now,
     }
-    _kv_set(_playlist_key(playlist_id), _dump_json(record))
-    _kv_set_add(_user_playlists_key(user_id), playlist_id)
-    return _record_to_playlist(record, [])
-
-
-def _load_playlist_record(playlist_id: str) -> Optional[dict[str, Any]]:
-    return _load_json(_kv_get(_playlist_key(playlist_id)))
+    if _client:
+        _client.table("playlists").insert(rec).execute()
+    else:
+        _local_store["playlists"].append(rec)
+    return _record_to_playlist(rec, [])
 
 
 def list_playlists(user_id: str) -> list[dict[str, Any]]:
-    ids = _kv_set_members(_user_playlists_key(user_id))
-    records = []
-    for pid in ids:
-        rec = _load_playlist_record(pid)
-        if rec:
-            records.append(rec)
-    records.sort(key=lambda r: r.get("updated_at", ""), reverse=True)
-    return [_record_to_playlist(r, _read_playlist_tracks(r["id"])) for r in records]
+    if _client:
+        res = _client.table("playlists").select("*").eq("user_id", user_id).order(
+            "updated_at", desc=True
+        ).execute()
+        records = res.data or []
+    else:
+        records = [r for r in _local_store["playlists"] if r["user_id"] == user_id]
+        records.sort(key=lambda r: r.get("updated_at", ""), reverse=True)
+    return [_record_to_playlist(r, _list_tracks(r["id"])) for r in records]
 
 
 def get_playlist(user_id: str, playlist_id: str) -> Optional[dict[str, Any]]:
-    rec = _load_playlist_record(playlist_id)
-    if not rec or rec.get("user_id") != user_id:
+    if _client:
+        res = _client.table("playlists").select("*").eq("id", playlist_id).eq(
+            "user_id", user_id
+        ).limit(1).execute()
+        rec = res.data[0] if res.data else None
+    else:
+        rows = _local_find("playlists", id=playlist_id, user_id=user_id)
+        rec = rows[0] if rows else None
+    if not rec:
         return None
-    return _record_to_playlist(rec, _read_playlist_tracks(playlist_id))
+    return _record_to_playlist(rec, _list_tracks(playlist_id))
 
 
 def update_playlist(
-    user_id: str,
-    playlist_id: str,
-    *,
-    name: Optional[str] = None,
-    description: Optional[str] = None,
+    user_id: str, playlist_id: str, *,
+    name: Optional[str] = None, description: Optional[str] = None,
     collaborative: Optional[bool] = None,
 ) -> Optional[dict[str, Any]]:
-    rec = _load_playlist_record(playlist_id)
-    if not rec or rec.get("user_id") != user_id:
-        return None
+    updates: dict[str, Any] = {"updated_at": _now()}
     if name is not None:
-        rec["name"] = name.strip() or "Untitled Playlist"
+        updates["name"] = name.strip() or "Untitled Playlist"
     if description is not None:
-        rec["description"] = description.strip()
+        updates["description"] = description.strip()
     if collaborative is not None:
-        rec["is_collaborative"] = bool(collaborative)
-    rec["updated_at"] = _now()
-    _kv_set(_playlist_key(playlist_id), _dump_json(rec))
+        updates["is_collaborative"] = bool(collaborative)
+    if _client:
+        _client.table("playlists").update(updates).eq("id", playlist_id).eq(
+            "user_id", user_id
+        ).execute()
+    else:
+        for r in _local_store["playlists"]:
+            if r["id"] == playlist_id and r["user_id"] == user_id:
+                r.update(updates)
     return get_playlist(user_id, playlist_id)
 
 
 def delete_playlist(user_id: str, playlist_id: str) -> bool:
-    rec = _load_playlist_record(playlist_id)
-    if not rec or rec.get("user_id") != user_id:
-        return False
-    _kv_delete(_playlist_key(playlist_id), _playlist_items_key(playlist_id))
-    _kv_set_remove(_user_playlists_key(user_id), playlist_id)
-    return True
+    if _client:
+        res = _client.table("playlists").delete().eq("id", playlist_id).eq(
+            "user_id", user_id
+        ).execute()
+        deleted = bool(res.data)
+        if deleted:
+            _client.table("playlist_items").delete().eq("playlist_id", playlist_id).execute()
+        return deleted
+    removed = _local_delete("playlists", id=playlist_id, user_id=user_id)
+    if removed:
+        _local_delete("playlist_items", playlist_id=playlist_id)
+        return True
+    return False
 
 
-def add_song_to_playlist(user_id: str, playlist_id: str, song: Any) -> Optional[dict[str, Any]]:
-    rec = _load_playlist_record(playlist_id)
-    if not rec or rec.get("user_id") != user_id:
-        return None
-    song_doc = _serialize_song(song)
-    entry = _dump_json(song_doc)
-    key = _playlist_items_key(playlist_id)
-    if _redis:
-        _redis.rpush(key, entry)
+def add_song_to_playlist(
+    user_id: str, playlist_id: str, song: Any
+) -> Optional[dict[str, Any]]:
+    # Ownership check
+    if _client:
+        owner = _client.table("playlists").select("id").eq("id", playlist_id).eq(
+            "user_id", user_id
+        ).limit(1).execute()
+        if not owner.data:
+            return None
     else:
-        lst = list(_local_store.get(key, []))
-        lst.append(entry)
-        _local_store[key] = lst
-    rec["updated_at"] = _now()
-    _kv_set(_playlist_key(playlist_id), _dump_json(rec))
+        if not _local_find("playlists", id=playlist_id, user_id=user_id):
+            return None
+    song_doc = _serialize_song(song)
+    if _client:
+        last = _client.table("playlist_items").select("position").eq(
+            "playlist_id", playlist_id
+        ).order("position", desc=True).limit(1).execute()
+        next_pos = ((last.data[0]["position"] + 1) if last.data else 1)
+        _client.table("playlist_items").insert({
+            "playlist_id": playlist_id, "position": next_pos,
+            "song": song_doc, "added_at": _now(),
+        }).execute()
+        _client.table("playlists").update({"updated_at": _now()}).eq(
+            "id", playlist_id
+        ).execute()
+    else:
+        items = [r for r in _local_store["playlist_items"] if r["playlist_id"] == playlist_id]
+        next_pos = max((r["position"] for r in items), default=0) + 1
+        _local_store["playlist_items"].append({
+            "playlist_id": playlist_id, "position": next_pos,
+            "song": song_doc, "added_at": _now(),
+        })
+        for r in _local_store["playlists"]:
+            if r["id"] == playlist_id:
+                r["updated_at"] = _now()
     return get_playlist(user_id, playlist_id)
 
 
 def remove_song_from_playlist(
     user_id: str, playlist_id: str, song_id: str
 ) -> Optional[dict[str, Any]]:
-    rec = _load_playlist_record(playlist_id)
-    if not rec or rec.get("user_id") != user_id:
-        return None
-    tracks = _read_playlist_tracks(playlist_id)
-    remaining = [t for t in tracks if str(t.get("id")) != str(song_id)]
-    _write_playlist_tracks(playlist_id, remaining)
-    rec["updated_at"] = _now()
-    _kv_set(_playlist_key(playlist_id), _dump_json(rec))
+    if _client:
+        owner = _client.table("playlists").select("id").eq("id", playlist_id).eq(
+            "user_id", user_id
+        ).limit(1).execute()
+        if not owner.data:
+            return None
+        # Fetch items to filter by nested song.id (Supabase JSONB filter uses ->>)
+        items = _client.table("playlist_items").select("id,song").eq(
+            "playlist_id", playlist_id
+        ).execute()
+        ids_to_del = [it["id"] for it in (items.data or []) if str(it["song"].get("id")) == str(song_id)]
+        if ids_to_del:
+            _client.table("playlist_items").delete().in_("id", ids_to_del).execute()
+        _client.table("playlists").update({"updated_at": _now()}).eq("id", playlist_id).execute()
+    else:
+        if not _local_find("playlists", id=playlist_id, user_id=user_id):
+            return None
+        _local_store["playlist_items"] = [
+            r for r in _local_store["playlist_items"]
+            if not (r["playlist_id"] == playlist_id and str(r["song"].get("id")) == str(song_id))
+        ]
+        for r in _local_store["playlists"]:
+            if r["id"] == playlist_id:
+                r["updated_at"] = _now()
     return get_playlist(user_id, playlist_id)
 
 
 def reorder_playlist_track(
     user_id: str, playlist_id: str, song_id: str, position: int
 ) -> Optional[dict[str, Any]]:
-    rec = _load_playlist_record(playlist_id)
-    if not rec or rec.get("user_id") != user_id:
-        return None
-    tracks = _read_playlist_tracks(playlist_id)
-    moving = next((t for t in tracks if str(t.get("id")) == str(song_id)), None)
+    if _client:
+        owner = _client.table("playlists").select("id").eq("id", playlist_id).eq(
+            "user_id", user_id
+        ).limit(1).execute()
+        if not owner.data:
+            return None
+        items_res = _client.table("playlist_items").select("*").eq(
+            "playlist_id", playlist_id
+        ).order("position", desc=False).execute()
+        items = items_res.data or []
+    else:
+        if not _local_find("playlists", id=playlist_id, user_id=user_id):
+            return None
+        items = [r for r in _local_store["playlist_items"] if r["playlist_id"] == playlist_id]
+        items.sort(key=lambda r: r.get("position", 0))
+    moving = next((it for it in items if str(it["song"].get("id")) == str(song_id)), None)
     if moving is None:
         return get_playlist(user_id, playlist_id)
-    rest = [t for t in tracks if str(t.get("id")) != str(song_id)]
+    rest = [it for it in items if str(it["song"].get("id")) != str(song_id)]
     insert_at = max(0, min(position, len(rest)))
     rest.insert(insert_at, moving)
-    _write_playlist_tracks(playlist_id, rest)
-    rec["updated_at"] = _now()
-    _kv_set(_playlist_key(playlist_id), _dump_json(rec))
-    return get_playlist(user_id, playlist_id)
-
-
-def _write_playlist_tracks(playlist_id: str, tracks: list[dict[str, Any]]) -> None:
-    key = _playlist_items_key(playlist_id)
-    _kv_delete(key)
-    if not tracks:
-        return
-    entries = [_dump_json(t) for t in tracks]
-    if _redis:
-        _redis.rpush(key, *entries)
+    for idx, item in enumerate(rest, start=1):
+        if _client:
+            _client.table("playlist_items").update({"position": idx}).eq(
+                "id", item["id"]
+            ).execute()
+        else:
+            item["position"] = idx
+    if _client:
+        _client.table("playlists").update({"updated_at": _now()}).eq("id", playlist_id).execute()
     else:
-        _local_store[key] = entries
+        for r in _local_store["playlists"]:
+            if r["id"] == playlist_id:
+                r["updated_at"] = _now()
+    return get_playlist(user_id, playlist_id)
 
 
 def export_playlists(user_id: str) -> list[dict[str, Any]]:
@@ -594,17 +588,28 @@ def import_playlists(
 
 # ── Playback state ────────────────────────────────────────────────────────────
 
-def _playback_key(user_id: str) -> str:
-    return f"playback:{user_id}"
-
-
 def save_playback_state(user_id: str, state: dict[str, Any]) -> None:
-    _kv_set(_playback_key(user_id), _dump_json({"state": state, "updated_at": _now()}))
+    row = {"user_id": user_id, "state": state, "updated_at": _now()}
+    if _client:
+        _client.table("playback_state").upsert(row, on_conflict="user_id").execute()
+    else:
+        for r in _local_store["playback_state"]:
+            if r["user_id"] == user_id:
+                r.update(row)
+                return
+        _local_store["playback_state"].append(row)
 
 
 def load_playback_state(user_id: str) -> dict[str, Any] | None:
-    data = _load_json(_kv_get(_playback_key(user_id)))
-    return data.get("state") if data else None
+    if _client:
+        res = _client.table("playback_state").select("state").eq(
+            "user_id", user_id
+        ).limit(1).execute()
+        return res.data[0]["state"] if res.data else None
+    for r in _local_store["playback_state"]:
+        if r["user_id"] == user_id:
+            return r.get("state")
+    return None
 
 
 # ── Analytics ─────────────────────────────────────────────────────────────────
