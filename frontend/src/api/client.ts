@@ -1,6 +1,5 @@
 import axios from 'axios';
 import type { Song } from '../types';
-import { MOCK_SONGS, LOCAL_RECS } from '../data/mockData';
 
 const http = axios.create({ baseURL: import.meta.env.VITE_API_URL || '', timeout: 30_000 });
 
@@ -52,13 +51,7 @@ export async function searchSongs(q: string): Promise<Song[]> {
     const res = await http.get<{ results: Song[] }>('/api/search/advanced', { params: { q } });
     return res.data.results ?? [];
   } catch {
-    const query = q.toLowerCase();
-    const hits = MOCK_SONGS.filter(s =>
-      s.title.toLowerCase().includes(query) ||
-      s.artist.toLowerCase().includes(query) ||
-      s.genre.toLowerCase().includes(query)
-    );
-    return hits.length ? hits : MOCK_SONGS;
+    return [];
   }
 }
 
@@ -69,7 +62,7 @@ export async function getRecommendations(songId: string, limit = 5): Promise<Son
     });
     return res.data.recommendations ?? [];
   } catch {
-    return LOCAL_RECS.filter(s => s.id !== songId).slice(0, limit);
+    return [];
   }
 }
 
